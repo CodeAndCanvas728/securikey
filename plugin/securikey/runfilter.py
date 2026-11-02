@@ -107,13 +107,13 @@ class StreamFilter:
         text, _ = redact(text, known=self.known, patterns=False)
         if final:
             cut = len(text)
-        elif quiet:
+        elif quiet and not self.multiline:
             cut = text.rfind("\n") + 1
-            if self.multiline:
-                cut = min(cut, max(0, len(text) - self.hold))
         else:
             # Release only whole lines older than the hold-back: no pattern spans a line break, so a
-            # token longer than the hold-back (a large JWT) is never written out in pieces.
+            # token longer than the hold-back (a large JWT) is never written out in pieces. This also
+            # covers a pause while a stored multi-line value is held: the cut is still a line break, never
+            # a point inside a line, which would split a long token.
             limit = max(0, len(text) - self.hold)
             cut = max(text.rfind("\n", 0, limit), text.rfind("\r", 0, limit)) + 1
         if len(text) - cut > MAX_HELD:

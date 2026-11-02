@@ -1,14 +1,22 @@
 # SecuriKey
 
+[![CI](https://github.com/CodeAndCanvas728/securikey/actions/workflows/ci.yml/badge.svg)](https://github.com/CodeAndCanvas728/securikey/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+![Platforms: macOS and Linux](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-blue)
+
 **Keeps API keys and tokens out of Claude's context.** Secrets live in the OS keychain, and the agent only ever works with their **names**. A prompt or tool call that contains a secret is blocked, and tool output is redacted before the model sees it, whenever the call succeeds or the command was started with `skey run`.
 
 One gap, stated up front: if a command that did **not** get its secret through `skey run` fails (non-zero exit), Claude Code skips the redaction hook and the model sees what it printed. [Details and what covers it](#known-gap-a-failing-command).
 
+![Terminal recording: the agent runs a command with a stored token; the output shows the name, not the value, and the exit status is kept](docs/demo.gif)
+
+*Animated from a real capture: a throwaway keychain entry and a demo value, with the commands typed out and the output exactly as printed. The green line is an annotation, not output.* The same idea in text, with a real API call added:
+
 ```text
 you    $ skey add github                                  # hidden prompt, stored in the OS keychain
 agent  $ skey run --env GH_TOKEN=github -- gh api user    # only the child process gets the value
-agent  $ skey run --env GH_TOKEN=github -- sh -c 'echo $GH_TOKEN; exit 1'
-       [securikey:github]                                 # redacted, and the exit status is still 1
+agent  $ skey run --env GH_TOKEN=github -- sh -c 'echo "token: $GH_TOKEN"; exit 1'
+       token: [securikey:github]                          # redacted, and the exit status is still 1
 ```
 
 ## Quickstart

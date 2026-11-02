@@ -119,6 +119,23 @@ class StreamFilterTest(unittest.TestCase):
         self.assertNotIn("Of-Secret", text)
         self.assertEqual(text, "before\n[securikey:cert]\nafter\n")
 
+    def test_a_pause_with_a_multiline_value_never_cuts_inside_a_token(self):
+        # With a stored multi-line value a pause releases only what is older than the hold-back. That
+        # point must still be a line break: cutting inside a complete line splits a long token, the
+        # pattern then redacts the first piece and the rest is released as plain text.
+        known = known_forms({"cert": "line-one-Of-Secret-1\nline-two-Of-Secret-2"})
+        jwt = "eyJ" + "a" * 20 + ".eyJ" + "b" * 20 + "." + "c" * 3000
+        data = (jwt + "\n" + "x" * 2000 + "\n").encode()
+        out = []
+        flt = runfilter.StreamFilter(known, out.append)
+        flt.feed(data)
+        flt.quiet()
+        flt.finish()
+        text = "".join(out)
+        self.assertNotIn("c" * 50, text)
+        self.assertNotIn("eyJ", text)
+        self.assertIn("[redacted:jwt]", text)
+
     def test_a_multibyte_character_split_across_reads_survives(self):
         data = ("café ✓ ok %s\n" % SECRET).encode()
         text = filtered(split(data, 1))
