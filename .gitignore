@@ -1,0 +1,34 @@
+# Secrets — never commit a .env or a vault file
+.env
+.env.*
+!.env.example
+*.enc
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# Per-machine agent wiring and local tooling: generated, and some of it holds personal paths
+.code-review-graph/
+.mcp.json
+opencode.json
+.cursor/
+.cursorrules
+.windsurfrules
+.gemini/
+GEMINI.md
+.kiro/
+.qoder/
+QODER.md
+.codebuddy/
+CODEBUDDY.md
+.github/instructions/
+.claude/settings.local.json
+.claude/*.bak
+
+# The pre-3.0.0 token-vault scripts (the plugin in plugin/ replaced them)
+/scripts/

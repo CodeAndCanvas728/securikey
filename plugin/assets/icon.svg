@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-label="SecuriKey">
+  <rect width="1024" height="1024" rx="224" fill="#0F3D3E"/>
+  <g transform="translate(512 512) rotate(-45) translate(-485 -512)" fill="#F2C14E">
+    <path fill-rule="evenodd" d="M330 342a170 170 0 1 0 0 340a170 170 0 1 0 0-340zM330 442a70 70 0 1 1 0 140a70 70 0 1 1 0-140z"/>
+    <rect x="480" y="484" width="330" height="56"/>
+    <rect x="700" y="540" width="40" height="80"/>
+    <rect x="770" y="540" width="40" height="50"/>
+  </g>
+</svg>

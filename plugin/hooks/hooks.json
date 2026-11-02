@@ -1,0 +1,106 @@
+{
+  "description": "securikey: keep secrets out of tool inputs, tool outputs and prompts.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv",
+            "args": [
+              "run",
+              "--quiet",
+              "--script",
+              "${CLAUDE_PLUGIN_ROOT}/bin/skey",
+              "warm"
+            ],
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv",
+            "args": [
+              "run",
+              "--quiet",
+              "--script",
+              "${CLAUDE_PLUGIN_ROOT}/bin/skey",
+              "hook",
+              "pre"
+            ],
+            "timeout": 15,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv",
+            "args": [
+              "run",
+              "--quiet",
+              "--script",
+              "${CLAUDE_PLUGIN_ROOT}/bin/skey",
+              "hook",
+              "post"
+            ],
+            "timeout": 15,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv",
+            "args": [
+              "run",
+              "--quiet",
+              "--script",
+              "${CLAUDE_PLUGIN_ROOT}/bin/skey",
+              "hook",
+              "failure"
+            ],
+            "timeout": 15,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv",
+            "args": [
+              "run",
+              "--quiet",
+              "--script",
+              "${CLAUDE_PLUGIN_ROOT}/bin/skey",
+              "hook",
+              "prompt"
+            ],
+            "timeout": 15,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ]
+  }
+}

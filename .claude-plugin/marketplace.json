@@ -1,0 +1,14 @@
+{
+  "name": "codeandcanvas",
+  "description": "Claude Code plugins by CodeAndCanvas728: SecuriKey keeps API keys and tokens out of Claude's context.",
+  "owner": {
+    "name": "CodeAndCanvas728"
+  },
+  "plugins": [
+    {
+      "name": "securikey",
+      "source": "./plugin",
+      "description": "Keeps API keys and tokens out of Claude's context: secrets live in the OS keychain, commands get them by name through `skey run`, and hooks block any secret in a prompt or tool input and redact it from the output of calls that succeed or run through `skey run`."
+    }
+  ]
+}
