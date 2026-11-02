@@ -118,6 +118,19 @@ class PreToolUseTest(unittest.TestCase):
         for name in [".environment", "environment.md", "config.json", ".envrc.example"]:
             self.assertFalse(hooks.DOTENV_NAME_RE.match(name) and not hooks.SAFE_ENV_RE.fullmatch(name), name)
 
+    def test_the_env_name_patterns_are_linear_on_long_names(self):
+        # A body class that also holds `_` and `-` made `.env_a_a_a...!` exponential: 55 characters took 7 s.
+        for text in (".env" + "_a" * 5000 + "!", "cat /x/.env" + "-a" * 5000 + "!", ".envrc" + "_-" * 5000 + "!"):
+            start = time.monotonic()
+            hooks.ENV_FILE_RE.search(text)
+            hooks._env_names(text)
+            self.assertLess(time.monotonic() - start, 1, text[:20])
+        for name in (".env" + "_a" * 5000 + ".example", ".env" + "_a" * 5000 + "!"):
+            start = time.monotonic()
+            hooks.SAFE_ENV_RE.fullmatch(name)
+            self.assertLess(time.monotonic() - start, 1)
+        self.assertTrue(denied(hooks.handle("pre", bash("cat .env_local_backup"), STORE)))
+
     def test_a_very_long_command_does_not_stall_the_sync_gate(self):
         start = time.monotonic()
         self.assertFalse(hooks._runs_human_only("echo " + "{" * 100000))

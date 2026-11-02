@@ -10,7 +10,7 @@ import binascii
 import unittest
 import urllib.parse
 
-from securikey.redact import redact
+from securikey.redact import find, redact
 
 SECRET = "Zx9-quiet-Deploy-Value-7421"
 STORED = {"deploy_key": SECRET}
@@ -38,6 +38,14 @@ class ExpectedPassThroughTest(unittest.TestCase):
 
     def test_a_case_changed_value_is_not_redacted(self):
         self.assertTrue(passes_through(SECRET.upper()))
+
+    def test_an_unstored_jwt_glued_to_a_token_character_is_not_recognised_by_pattern(self):
+        # The jwt pattern does not start inside a run of token characters: that is what keeps it linear
+        # (a run of "-eyJ" was quadratic and stalled the hooks). A stored JWT is still matched exactly.
+        jwt = "eyJhbGciOiJIUzI1NiJ9" + ".eyJzdWIiOiIxMjM0NTY3ODkwIn0" + ".dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+        self.assertEqual(find("token " + jwt, {}), ["jwt"])
+        self.assertEqual(find("token-" + jwt, {}), [])
+        self.assertEqual(find("token-" + jwt, {"stored_jwt": jwt}), ["stored_jwt"])
 
 
 class MatchedFormsTest(unittest.TestCase):

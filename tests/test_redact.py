@@ -39,6 +39,14 @@ class PatternTest(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 1)
         self.assertEqual(find("token=" + JWT, {}), ["jwt"])
 
+    def test_every_private_key_armor_header_is_found(self):
+        for label in ("RSA PRIVATE KEY", "EC PRIVATE KEY", "ENCRYPTED PRIVATE KEY", "SSH2 ENCRYPTED PRIVATE KEY",
+                      "PGP PRIVATE KEY BLOCK"):
+            text = "x -----BEGIN " + label + "-----\nQUJDREVGR0hJSktM\n-----END " + label + "-----\ny"
+            self.assertEqual(find(text, {}), ["private_key"], label)
+            self.assertEqual(redact(text, {})[0], "x [redacted:private_key]\ny", label)
+        self.assertEqual(find("-----BEGIN " + "PGP PUBLIC KEY BLOCK-----\nabc\n", {}), [])  # a public key is not secret
+
     def test_provider_tokens_are_found(self):
         cases = {"github": GH, "aws_access_key": AWS, "anthropic": "sk-ant-" + "x" * 30,
                  "slack": SLACK, "private_key": PEM_OPENSSH, "jwt": JWT}

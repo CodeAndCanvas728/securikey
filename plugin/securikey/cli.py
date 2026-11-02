@@ -148,7 +148,11 @@ def _redaction_set(store, secrets):
     values (a rotated-out value, a value fetched from Paperclip)."""
     try:
         watched = store.load_watch()
-    except VaultError:  # the watch list only adds protection; the stored secrets are still covered
+    except VaultError as exc:
+        if is_headless():  # nobody would read a warning: a reduced redaction set is a failed check
+            raise
+        print("skey: the watch list could not be read (%s), so values rotated out or fetched from Paperclip "
+              "are not redacted from this command's output; the stored secrets still are" % exc, file=sys.stderr)
         watched = {}
     return {**watched, **secrets}
 
@@ -358,23 +362,23 @@ def cmd_sync(args, store):
         wanted = sorted(set(chosen))
     existing = client.list_secrets(company)
     created = updated = kept = 0
-    sent = []  # names whose value reached Paperclip: what the audit log must hold, also if a later one fails
-    try:
+    sent = []  # names whose value was offered to Paperclip: appended before the request, so a request that
+    try:      # failed after it reached the server is still in the audit log
         for name in wanted:
             if name not in existing:
                 if args.dry_run:
                     print("would create %s" % name)
                 else:
-                    print("created %s %s" % (name, client.create(company, name, secrets[name])))
                     sent.append(name)
+                    print("created %s %s" % (name, client.create(company, name, secrets[name])))
                 created += 1
             elif args.update:
                 if args.dry_run:
                     print("would update %s %s" % (name, existing[name]))
                 else:
+                    sent.append(name)
                     client.rotate(existing[name], secrets[name])
                     print("updated %s %s" % (name, existing[name]))
-                    sent.append(name)
                 updated += 1
             else:
                 print("exists %s %s (kept; --update stores a new version)" % (name, existing[name]))

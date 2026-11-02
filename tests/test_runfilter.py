@@ -63,6 +63,52 @@ class StreamFilterTest(unittest.TestCase):
         text = filtered(split(data, 5))
         self.assertEqual(text, "[redacted:private_key]")
 
+    def test_other_private_key_headers_are_dropped_too(self):
+        for head, end in (("-----BEGIN " + "PGP PRIVATE KEY BLOCK-----", "-----END " + "PGP PRIVATE KEY BLOCK-----"),
+                          ("-----BEGIN " + "SSH2 ENCRYPTED PRIVATE KEY-----",
+                           "-----END " + "SSH2 ENCRYPTED PRIVATE KEY-----"),
+                          ("-----BEGIN " + "ENCRYPTED PRIVATE KEY-----", "-----END " + "ENCRYPTED PRIVATE KEY-----")):
+            data = ("a\n%s\nQUJDREVGR0hJSktMTU5PUA\n%s\nb\n" % (head, end)).encode()
+            for size in (1, 7, len(data)):
+                text = filtered(split(data, size))
+                self.assertNotIn("QUJDREVG", text, (head, size))
+                self.assertEqual((text[:2], text[-2:]), ("a\n", "b\n"), (head, size))
+
+    def test_bytes_that_are_not_utf8_come_out_unchanged(self):
+        # A binary download on stdout (curl -o -, git archive): the filter must not damage it.
+        data = bytes(range(256)) * 40 + b"\xff\xfe\x80 tail"
+        out = []
+        flt = runfilter.StreamFilter(KNOWN, lambda text: out.append(text.encode("utf-8", "surrogateescape")))
+        for chunk in split(data, 333):
+            flt.feed(chunk)
+        flt.finish()
+        self.assertEqual(b"".join(out), data)
+
+    def test_a_secret_inside_otherwise_binary_output_is_still_redacted(self):
+        data = b"\xff\xfe\x00" * 50 + SECRET.encode() + b"\x80\x81" * 50
+        out = []
+        flt = runfilter.StreamFilter(KNOWN, lambda text: out.append(text.encode("utf-8", "surrogateescape")))
+        for chunk in split(data, 17):
+            flt.feed(chunk)
+        flt.finish()
+        joined = b"".join(out)
+        self.assertNotIn(SECRET.encode(), joined)
+        self.assertIn(b"[securikey:deploy_key]", joined)
+        self.assertTrue(joined.startswith(b"\xff\xfe\x00" * 50) and joined.endswith(b"\x80\x81" * 50))
+
+    def test_a_multiline_value_split_by_a_pause_is_still_redacted(self):
+        value = "line-one-Of-Secret-1\nline-two-Of-Secret-2"
+        known = known_forms({"cert": value})
+        out = []
+        flt = runfilter.StreamFilter(known, out.append)
+        flt.feed(b"before\nline-one-Of-Secret-1\n")
+        flt.quiet()  # a pause between the two lines of the value must not release the first
+        flt.feed(b"line-two-Of-Secret-2\nafter\n")
+        flt.finish()
+        text = "".join(out)
+        self.assertNotIn("Of-Secret", text)
+        self.assertEqual(text, "before\n[securikey:cert]\nafter\n")
+
     def test_a_multibyte_character_split_across_reads_survives(self):
         data = ("café ✓ ok %s\n" % SECRET).encode()
         text = filtered(split(data, 1))
@@ -129,10 +175,21 @@ class WhenItFiltersTest(unittest.TestCase):
         store.add_watch("retired:old", "an-old-Value-0001", 60)
         self.assertEqual(set(cli._redaction_set(store, store.load())), {"deploy_key", "retired:old"})
 
-    def test_an_unreadable_watch_list_still_leaves_the_stored_secrets(self):
+    def test_an_unreadable_watch_list_warns_and_keeps_the_stored_secrets(self):
         store = MemoryStore({"deploy_key": SECRET})
-        with mock.patch.object(store, "load_watch", side_effect=VaultError("locked")):
+        err = io.StringIO()
+        with mock.patch.object(store, "load_watch", side_effect=VaultError("locked")), \
+                mock.patch("sys.stderr", err), mock.patch.dict(os.environ, {"SECURIKEY_HEADLESS": ""}):
             self.assertEqual(cli._redaction_set(store, store.load()), {"deploy_key": SECRET})
+        self.assertIn("watch list could not be read", err.getvalue())
+        self.assertNotIn(SECRET, err.getvalue())
+
+    def test_an_unreadable_watch_list_fails_closed_when_headless(self):
+        store = MemoryStore({"deploy_key": SECRET})
+        with mock.patch.object(store, "load_watch", side_effect=VaultError("locked")), \
+                mock.patch.dict(os.environ, {"SECURIKEY_HEADLESS": "1"}):
+            with self.assertRaises(VaultError):
+                cli._redaction_set(store, store.load())
 
     def test_cmd_run_returns_the_childs_status_through_the_filter(self):
         store = MemoryStore({"deploy_key": SECRET})

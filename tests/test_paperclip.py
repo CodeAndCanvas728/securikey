@@ -314,6 +314,19 @@ class SyncTest(PaperclipCase):
         self.assertEqual(body, {"name": "zz_test", "key": "zz_test", "value": FAKE})
         self.assertEqual(list(self.server.secrets), ["zz_test"])  # the token itself is not synced
 
+    def test_a_failure_part_way_still_audits_every_name_that_was_attempted(self):
+        # The audit log answers "which values were sent": a request that failed after it reached the server
+        # must be in it, so a name is recorded before its request, not after.
+        store = MemoryStore({"aa_one": FAKE, "bb_two": FAKE + "2", paperclip.TOKEN_NAME: TOKEN},
+                            service="securikey-audit-partial")
+        with mock.patch.object(paperclip.Client, "create", side_effect=["id-1", VaultError("boom")]):
+            code, out, err = run_cli(["sync", "paperclip"], store)
+        self.assertEqual(code, 1)
+        self.assertIn("created aa_one id-1", out)
+        lines = audit.log_path("securikey-audit-partial").read_text().splitlines()
+        self.assertEqual(json.loads(lines[-1])["names"], ["aa_one", "bb_two"])
+        self.assertNotIn(FAKE, audit.log_path("securikey-audit-partial").read_text())
+
     def test_an_existing_secret_is_kept_unless_update_is_given(self):
         self.server.secrets["zz_test"] = "id-9"
         _, out, _ = run_cli(["sync", "paperclip"], self.store())

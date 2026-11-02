@@ -15,7 +15,8 @@ MIN_SECRET_LEN = 8  # shorter stored values would redact ordinary words
 # under a standard header. The body may span lines, may be JSON-escaped, may
 # carry RFC 1423 pre-headers, and may end mid-line, so it is not matched
 # shape by shape: a header means everything after it is redacted.
-PEM_RE = r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z]+ )*PRIVATE KEY-----|$)"
+PEM_RE = (r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----[\s\S]*?"
+          r"(?:-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----|$)")  # RSA, EC, OPENSSH, SSH2 ENCRYPTED, PGP ... BLOCK
 
 PATTERNS = {
     "github": r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{50,})",

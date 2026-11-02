@@ -25,8 +25,9 @@ HOLD_MIN = 4096  # characters kept back until more output arrives; more if a sto
 QUIET = 0.25  # seconds without output after which every complete line is released
 READ_SIZE = 65536
 MAX_HELD = 1 << 20  # a cap on what is held back while waiting for a line that never ends
-PEM_BEGIN = re.compile(r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----")
-PEM_END = re.compile(r"-----END (?:[A-Z]+ )*PRIVATE KEY-----")
+# Any armor header that names a private key (RSA, EC, OPENSSH, ENCRYPTED, SSH2 ENCRYPTED, PGP ... BLOCK).
+PEM_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----")
+PEM_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----")
 PEM_TAIL = 64  # kept while inside a key, so an END line split across two reads is still seen
 
 
@@ -38,7 +39,12 @@ class StreamFilter:
         self.known, self.write = known, write
         longest = max((len(form) for form, _ in known), default=0)
         self.hold = max(HOLD_MIN, longest)
-        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        # A stored value that spans lines can be split by a pause between two of its lines, so with one
+        # a pause releases only what is older than the hold-back, not every complete line.
+        self.multiline = any("\n" in form for form, _ in known)
+        # surrogateescape: bytes that are not UTF-8 (a binary download on stdout) survive the round trip
+        # unchanged instead of being replaced.
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="surrogateescape")
         self.buf = ""
         self.in_pem = False
         self.pem_tail = ""
@@ -93,6 +99,8 @@ class StreamFilter:
             cut = len(text)
         elif quiet:
             cut = text.rfind("\n") + 1
+            if self.multiline:
+                cut = min(cut, max(0, len(text) - self.hold))
         else:
             cut = max(0, len(text) - self.hold)
         if len(text) - cut > MAX_HELD:  # one endless line: release all but the hold-back
@@ -125,7 +133,7 @@ def _sink(stream):
             if not state["open"]:
                 return
             try:
-                stream.write(text.encode("utf-8", "replace"))
+                stream.write(text.encode("utf-8", "surrogateescape"))
                 stream.flush()
             except (BrokenPipeError, ValueError, OSError):
                 state["open"] = False  # the reader went away: keep draining the child so it can finish
