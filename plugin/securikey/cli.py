@@ -158,7 +158,13 @@ def _redaction_set(store, secrets, fetched=None):
         print("skey: the watch list could not be read (%s), so values rotated out or fetched from Paperclip "
               "are not redacted from this command's output; the stored secrets still are" % exc, file=sys.stderr)
         watched = {}
-    return {**watched, **(fetched or {}), **secrets}
+    # What hooks.handle adds on top of the store, in the same order: the child inherits the whole
+    # environment and runs in the project directory, so a watched variable or a .env value is in its output.
+    dotenv_secrets, problems = hooks.project_dotenv_secrets({"cwd": os.getcwd()})
+    env_secrets, env_problems = hooks.watched_env_secrets()
+    for problem in problems + env_problems:
+        print("skey: %s" % problem, file=sys.stderr)
+    return {**dotenv_secrets, **env_secrets, **watched, **(fetched or {}), **secrets}
 
 
 def _free_name(key, value, secrets):
@@ -170,7 +176,7 @@ def _free_name(key, value, secrets):
 
 
 def cmd_import(args, store):
-    with open(args.file) as fh:
+    with open(args.file, newline="") as fh:  # keep \r\n so the file is written back with its own endings
         text = fh.read()
     records, error = parse_dotenv(text)
     if error is not None:

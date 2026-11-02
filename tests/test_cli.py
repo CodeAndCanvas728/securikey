@@ -146,6 +146,17 @@ class ImportTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
             self.assertNotIn(SECRET, out)
 
+    def test_import_keeps_crlf_line_endings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".env")
+            with open(path, "wb") as fh:
+                fh.write(b"PORT=3000\r\nDB_PASSWORD='%s'\r\n" % SECRET.encode())
+            code, _, _ = run_cli(["import", path], MemoryStore())
+            with open(path, "rb") as fh:
+                data = fh.read()
+            self.assertEqual(code, 0)
+            self.assertEqual(data, b"PORT=3000\r\nDB_PASSWORD=securikey:db_password\r\n")
+
     def test_dry_run_changes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, ".env")

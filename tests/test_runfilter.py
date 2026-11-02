@@ -1,7 +1,9 @@
 import io
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from securikey import cli, runfilter
@@ -140,6 +142,116 @@ class StreamFilterTest(unittest.TestCase):
         self.assertEqual(text, "x" * 20000 + "[securikey:deploy_key]" + "y" * 20000)
 
 
+    def test_a_token_longer_than_the_hold_back_is_not_written_out_in_pieces(self):
+        jwt = "eyJ" + "a" * 6000 + ".eyJ" + "b" * 6000 + "." + "c" * 6000
+        for size in (5000, 8000, 13000):
+            with self.subTest(size=size):
+                text = filtered(split(("id_token=%s\nafter\n" % jwt).encode(), size))
+                self.assertEqual(text, "id_token=[redacted:jwt]\nafter\n")
+
+
+    def test_a_line_over_the_cap_is_withheld_whole_not_released_in_pieces(self):
+        notice = runfilter.LONG_LINE_NOTICE
+        size = runfilter.MAX_HELD + (1 << 19)  # 1.5 MiB
+        third = size // 3
+        jwt = "eyJ" + "a" * third + ".eyJ" + "b" * third + "." + "c" * third
+        text = filtered(split(("before\n" + jwt + "\nafter\n").encode(), 65536))
+        self.assertEqual(text, "before\n" + notice + "\nafter\n")
+        self.assertNotIn("eyJ", text)
+
+    def test_the_rest_of_a_withheld_line_is_dropped_however_it_arrives(self):
+        notice = runfilter.LONG_LINE_NOTICE
+        big = "x" * (runfilter.MAX_HELD + 10)
+        # the line break comes in the same read as the cap is passed, in a later one, and never
+        for tail, expected in (("\nnext\n", notice + "\nnext\n"), ("", notice)):
+            for chunk in (1 << 20, 100000):
+                with self.subTest(tail=tail, chunk=chunk):
+                    self.assertEqual(filtered(split((big + "y" * 5000 + tail).encode(), chunk)), expected)
+        # lines that follow are kept; the next long line is withheld on its own
+        out = []
+        flt = runfilter.StreamFilter(KNOWN, out.append)
+        for chunk in split(big.encode(), 65536) + [b"\none\n"] + split(big.encode(), 65536) + [b"\ntwo\n"]:
+            flt.feed(chunk)
+        flt.finish()
+        self.assertEqual("".join(out), notice + "\none\n" + notice + "\ntwo\n")
+
+    def test_a_long_line_that_is_already_complete_when_the_cap_is_passed_is_released_whole_and_redacted(self):
+        # The break arrived in the same read, so nothing is cut: the patterns see the whole line.
+        jwt = "eyJ" + "a" * 400000 + ".eyJ" + "b" * 400000 + "." + "c" * 400000
+        text = filtered([("id=%s\n%s\n" % (jwt, "z" * 20000)).encode()])
+        self.assertEqual(text, "id=[redacted:jwt]\n" + "z" * 20000 + "\n")
+
+    def test_a_long_line_ends_the_notice_even_when_the_stream_ends_inside_it(self):
+        out = []
+        flt = runfilter.StreamFilter(KNOWN, out.append)
+        flt.feed(b"x" * (runfilter.MAX_HELD + 10))
+        flt.feed(b"more of the same line")
+        flt.quiet()
+        flt.finish()
+        self.assertEqual("".join(out), runfilter.LONG_LINE_NOTICE)
+
+
+class PumpTest(unittest.TestCase):
+    def test_a_filter_that_raises_prints_nothing_more_and_still_drains_the_pipe(self):
+        r, w = os.pipe()
+        os.write(w, b"first chunk")
+        os.write(w, b"second chunk")
+        os.close(w)
+
+        class Broken:
+            def feed(self, data):
+                raise RuntimeError("boom")
+
+            def quiet(self):
+                pass
+
+            def finish(self):
+                raise RuntimeError("boom")
+
+        with os.fdopen(r, "rb") as pipe:
+            runfilter._pump(pipe, Broken())  # returns instead of raising or leaving the pipe full
+            self.assertEqual(os.read(pipe.fileno(), 10), b"")
+
+
+    def test_a_failure_anywhere_in_the_reader_still_drains_the_pipe(self):
+        for target, name in ((runfilter.select, "select"), (os, "read")):
+            with self.subTest(failing=name):
+                r, w = os.pipe()
+                os.write(w, b"data")
+                os.close(w)
+                real_read = os.read
+                calls = []
+
+                def read(fd, n):
+                    calls.append(fd)
+                    if name == "read" and len(calls) == 1:
+                        raise OSError("boom")  # the first read inside the loop fails, the drain's succeeds
+                    return real_read(fd, n)
+
+                patch = (mock.patch.object(runfilter.select, "select", side_effect=OSError("boom"))
+                         if name == "select" else mock.patch.object(runfilter.os, "read", read))
+                with os.fdopen(r, "rb") as pipe, patch:
+                    runfilter._pump(pipe, runfilter.StreamFilter(KNOWN, lambda text: self.fail("wrote " + text)))
+                    self.assertEqual(real_read(pipe.fileno(), 10), b"")
+
+    def test_a_reader_that_cannot_drain_closes_the_pipe_so_the_child_is_not_left_blocked(self):
+        r, w = os.pipe()
+        os.close(w)
+        pipe = os.fdopen(r, "rb")
+        with mock.patch.object(runfilter.select, "select", side_effect=OSError("boom")), \
+                mock.patch.object(runfilter.os, "read", side_effect=OSError("boom")):
+            runfilter._pump(pipe, runfilter.StreamFilter(KNOWN, lambda text: None))
+        self.assertTrue(pipe.closed)
+
+    def test_a_child_that_fills_the_pipe_is_not_hung_by_a_dead_reader(self):
+        out, err = io.BytesIO(), io.BytesIO()
+        with mock.patch.object(runfilter.StreamFilter, "quiet", side_effect=RuntimeError("boom")), \
+                mock.patch.object(runfilter, "QUIET", 0.01):
+            code = "import sys, time; time.sleep(0.2); sys.stdout.write('x' * 300000)"
+            status = runfilter.run([sys.executable, "-c", code], dict(os.environ), KNOWN, out, err)
+        self.assertEqual(status, 0)  # returned instead of hanging on a full pipe
+
+
 class RunTest(unittest.TestCase):
     def run_child(self, code, known=KNOWN):
         out, err = io.BytesIO(), io.BytesIO()
@@ -182,6 +294,35 @@ class WhenItFiltersTest(unittest.TestCase):
         store = MemoryStore({"deploy_key": SECRET})
         store.add_watch("retired:old", "an-old-Value-0001", 60)
         self.assertEqual(set(cli._redaction_set(store, store.load())), {"deploy_key", "retired:old"})
+
+    def test_the_redaction_set_holds_what_the_hooks_add_a_watched_variable_and_a_dotenv_value(self):
+        store = MemoryStore({"deploy_key": SECRET})
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, ".env").write_text("DB_PASSWORD=Dotenv-Value-From-File-9\n")
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                with mock.patch.dict(os.environ, {"SECURIKEY_WATCH_ENV": "PC_TOKEN",
+                                                  "PC_TOKEN": "Injected-By-Paperclip-55"}):
+                    found = cli._redaction_set(store, store.load())
+            finally:
+                os.chdir(cwd)
+        self.assertEqual(found["env:PC_TOKEN"], "Injected-By-Paperclip-55")
+        self.assertEqual(found["dotenv:DB_PASSWORD"], "Dotenv-Value-From-File-9")
+        self.assertEqual(found["deploy_key"], SECRET)
+
+    def test_a_failing_run_does_not_print_a_watched_variable(self):
+        store = MemoryStore({})
+        args = cli.parser().parse_args(["run", "--", sys.executable, "-c",
+                                        "import os, sys; print(os.environ['PC_TOKEN']); sys.exit(4)"])
+        out = io.BytesIO()
+        real = runfilter.run
+        with mock.patch.dict(os.environ, {"SECURIKEY_WATCH_ENV": "PC_TOKEN", "PC_TOKEN": "Injected-By-Paperclip-55"}), \
+                mock.patch("sys.stdout.isatty", return_value=False, create=True), \
+                mock.patch("securikey.cli.runfilter.run", lambda c, e, k: real(c, e, k, out, io.BytesIO())):
+            self.assertEqual(cli.cmd_run(args, store), 4)
+        self.assertNotIn(b"Injected-By-Paperclip-55", out.getvalue())
+        self.assertIn(b"[securikey:", out.getvalue())
 
     def test_an_unreadable_watch_list_warns_and_keeps_the_stored_secrets(self):
         store = MemoryStore({"deploy_key": SECRET})

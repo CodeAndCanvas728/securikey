@@ -22,14 +22,15 @@ from securikey.store import VaultError, is_headless
 ENV_FILE_RE = re.compile(
     r"(?:^|[\s/\"'=<:*$(){},])"
     r"(\.env(?:rc)?(?:[._-]+[A-Za-z0-9*]+)*"  # a run of separators, then a body that cannot hold them: linear
-    r"|(?:prod(?:uction)?|dev(?:elopment)?|stag(?:e|ing)|test|local|live|secrets?|credentials?)\.env)"
+    r"|(?:prod(?:uction)?|dev(?:elopment)?|stag(?:e|ing)|test|local|live|secrets?|credentials?)\.env"
+    r"(?:[._-]+[A-Za-z0-9*]+)*)"  # and a suffix after it (`prod.env.local`, `live.env.backup`)
     r"(?=$|[\s\"';|&)>*?$(),=])", re.IGNORECASE)
 # An example file, also as a suffix (`.env.local.example`), the same rule the scan script uses.
 SAFE_ENV_RE = re.compile(r"(?:[A-Za-z0-9_-]+)?\.env(?:rc)?(?:[._-][A-Za-z0-9]+)*\.(?:example|sample|template|dist)\b",
                          re.IGNORECASE)
 # The names the content scan reads: `.env` and anything after a dot. A name the plain .env
 # pattern doesn't cover (`.env.prod~`) still holds secrets, so it is read too.
-DOTENV_NAME_RE = re.compile(r"^(?:\.env(?:rc)?(?:[._-][^\s/\\]+)?|[^\s/\\]+\.env)$", re.IGNORECASE)
+DOTENV_NAME_RE = re.compile(r"^(?:\.env(?:rc)?(?:[._-][^\s/\\]+)?|[^\s/\\]+\.env(?:[._-][^\s/\\]+)?)$", re.IGNORECASE)
 METADATA_COMMANDS = {"ls", "test", "["}  # touch .env without printing its values
 # `ls --from-file=.env` prints the names in the file, so ls is only metadata
 # without it.
@@ -782,7 +783,10 @@ def pre_tool_use(event, secrets):
 def post_tool_use_failure(event, secrets):
     """A tool that failed. Claude Code runs PostToolUse only for a call that succeeds, and gives this event
     no way to replace the error text, so a secret in a failed call's output cannot be redacted, only
-    noticed: stop the turn and say so. (A hook cannot make the call succeed either. Appending to a Bash
+    noticed: tell the user, and tell the model not to repeat it. This is a warning, not a guarantee, and it
+    deliberately does not ask Claude Code to stop the turn: `continue: false` was logged and ignored in
+    `claude -p`, and interactively a false positive (a long base64-shaped blob in an unrelated error) would
+    abort the agent mid-task. (A hook cannot make the call succeed either. Appending to a Bash
     command, or wrapping it, makes Claude Code's own permission check ask about the added part, and a
     `trap` is refused outright; tried and ruled out.)"""
     error = event.get("error")
@@ -790,11 +794,15 @@ def post_tool_use_failure(event, secrets):
     found = sorted({label for s in _strings(error) for label in find(s, known=known)})
     if not found:
         return None
-    return {"continue": False,
-            "stopReason": "securikey: a failed %s call printed a secret (%s). Claude Code does not let a hook "
-                          "redact a failed call's output, so the model has seen it: rotate it if it matters. "
-                          "Run commands that handle secrets through `skey run`, which redacts its command's "
-                          "output even when the command fails." % (event.get("tool_name") or "tool", ", ".join(found))}
+    tool = event.get("tool_name") or "tool"
+    return {"systemMessage": "securikey: a failed %s call printed a secret (%s). Claude Code does not let a hook "
+                             "redact a failed call's output, so the model has seen it: change the secret if it "
+                             "matters. Run commands that handle secrets through `skey run`, which redacts its "
+                             "command's output even when the command fails." % (tool, ", ".join(found)),
+            "hookSpecificOutput": {"hookEventName": "PostToolUseFailure",
+                                   "additionalContext": "securikey: the error above contains a secret (%s). "
+                                                        "Do not repeat, quote or store it; refer to it by name."
+                                                        % ", ".join(found)}}
 
 
 def post_tool_use(event, secrets):

@@ -28,7 +28,7 @@ Needs [`uv`](https://docs.astral.sh/uv/) and Claude Code 2.1.295 or later. macOS
 | You paste a token into a prompt | `UserPromptSubmit` blocks it before it is sent; nothing reaches the API |
 | The agent puts a secret in a tool call (command, file edit, MCP call) | `PreToolUse` denies the call and names the secret, never its value |
 | A tool call that **succeeds** prints a secret | `PostToolUse` replaces the output with a redacted copy before the model sees it |
-| A command started with `skey run` prints a secret, **even if it fails** | `skey run` redacts its child's stdout and stderr itself and keeps the exit status |
+| A command started with `skey run` prints a secret, **even if it fails** (when its output is piped, as an agent's is; at a terminal it is not filtered) | `skey run` redacts its child's stdout and stderr itself and keeps the exit status |
 | The agent tries to read a dotenv file | Blocked; `skey import` moves the values into the keychain and leaves `securikey:<name>` references |
 | A command needs the secret | `skey run` injects it into that one child process's environment |
 

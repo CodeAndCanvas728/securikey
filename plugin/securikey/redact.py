@@ -125,15 +125,17 @@ def find(text, secrets=None, known=None):
     return sorted(labels)
 
 
-def redact(text, secrets=None, known=None):
-    """(redacted text, labels). Stored values become [securikey:NAME]; pattern hits [redacted:KIND]."""
+def redact(text, secrets=None, known=None, patterns=True):
+    """(redacted text, labels). Stored values become [securikey:NAME]; pattern hits [redacted:KIND].
+    patterns=False replaces stored values only (for text that may still be growing at its end: a pattern of
+    unbounded length would match a partial token and let the rest of it through)."""
     pairs = known if known is not None else known_forms(secrets or {})
     labels = set()
     for form, name in pairs:
         if form in text:
             text = text.replace(form, "[securikey:%s]" % name)
             labels.add(name)
-    for kind, rx in _COMPILED.items():
+    for kind, rx in (_COMPILED.items() if patterns else ()):
         text, n = rx.subn("[redacted:%s]" % kind, text)
         if n:
             labels.add(kind)

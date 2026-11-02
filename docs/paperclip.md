@@ -18,7 +18,7 @@ skey doctor --headless     # uv on PATH, keychain readable, Claude Code >= 2.1.2
 
 **Pulling from Paperclip.** Prefer plain env bindings with `SECURIKEY_WATCH_ENV`. Where an agent needs a value only on demand, `skey run --env-from-paperclip VAR=key -- <command>` fetches it with the run's own token (`PAPERCLIP_API_URL`, `PAPERCLIP_API_KEY`), registers it for redaction for 24 hours before the command starts, and passes it as `VAR`.
 
-**Audit.** `skey run`, `sync` and `rotate` append one line to `~/.cache/securikey/audit-<service>.log` (mode `0600`): time, service, command, secret names, variable names, the command's basename and its parent process. Never a value or an argument. Reconcile it with Paperclip's `secret_access_events`.
+**Audit.** `skey run`, `sync` and `rotate` append one line to `~/.cache/securikey/audit-<service>.log` (mode `0600`): time, service, command, secret names (for `sync`, the names whose values were sent to the server), variable names, the command's basename and its parent process. Never a value or an argument. Reconcile it with Paperclip's `secret_access_events`.
 
 **Hook cost.** `python bench/hook_cost.py` measures both tool hooks. On an Apple-silicon Mac (uv 0.11, 100 runs, empty store), the check itself takes about 1 ms; the end-to-end call, which is almost all `uv` and interpreter start-up, has p50 96 ms and p95 107 ms (pre) and 119 ms (post). Each tool call pays for both. The budget is p95 under 150 ms per hook; the script exits 1 when it is exceeded.
 

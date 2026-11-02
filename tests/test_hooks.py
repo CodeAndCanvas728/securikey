@@ -44,11 +44,15 @@ class FailedToolCallTest(unittest.TestCase):
         return {"hook_event_name": "PostToolUseFailure", "cwd": CWD, "tool_name": tool, "tool_input": {},
                 "error": error}
 
-    def test_an_error_with_a_secret_stops_the_turn_without_echoing_it(self):
+    def test_an_error_with_a_secret_is_flagged_without_echoing_it(self):
         for secret, label in ((self.GH, "github"), (SECRET, "deploy_key")):
             out = hooks.handle("failure", self.event("Exit code 22\nHTTP 401: token %s rejected" % secret), STORE)
-            self.assertIs(out["continue"], False)
-            self.assertIn(label, out["stopReason"])
+            # a warning to the user and a note to the model; it must not ask Claude Code to stop the turn
+            self.assertNotIn("continue", out)
+            self.assertNotIn("stopReason", out)
+            self.assertIn(label, out["systemMessage"])
+            self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "PostToolUseFailure")
+            self.assertIn(label, out["hookSpecificOutput"]["additionalContext"])
             self.assertNotIn(secret, json.dumps(out))
 
     def test_an_ordinary_error_passes(self):
@@ -111,6 +115,25 @@ class PreToolUseTest(unittest.TestCase):
         for cmd in ["grep -rn process.env src", "node -e 'console.log(process.env.HOME)'", "cat .environment",
                     "cat docs/environment.md"]:
             self.assertIsNone(hooks.handle("pre", bash(cmd), STORE), cmd)
+
+    def test_a_named_environment_with_a_suffix_is_checked(self):
+        names = ["prod.env.local", "secrets.env.local", "live.env.backup", "production.env.2024-01-01",
+                 "staging.env-old"]
+        for name in names:
+            self.assertTrue(denied(hooks.handle("pre", bash("cat " + name), STORE)), name)
+            read = {"tool_name": "Read", "tool_input": {"file_path": "/p/" + name}}
+            self.assertTrue(denied(hooks.handle("pre", read, STORE)), name)
+            self.assertTrue(hooks.DOTENV_NAME_RE.match(name), name)  # the content scan reads it too
+        for name in ("prod.env.local.example", "secrets.env.sample"):
+            self.assertIsNone(hooks.handle("pre", bash("cat " + name), STORE), name)
+        # code and words that only look like it
+        for cmd in ["grep -rn process.env.HOME src", "cat docs/environment.env.md.txt", "cat myprod.env.local"]:
+            self.assertIsNone(hooks.handle("pre", bash(cmd), STORE), cmd)
+        start = time.monotonic()
+        for text in ("prod.env" + "_a" * 5000 + "!", "cat live.env" + "-a." * 5000 + "!", "x" * 100000):
+            hooks.ENV_FILE_RE.search(text)
+            hooks.DOTENV_NAME_RE.match(text)
+        self.assertLess(time.monotonic() - start, 1)
 
     def test_the_content_scan_reads_the_same_names(self):
         for name in [".env", ".envrc", ".env.local", ".env-prod", ".env_local", "prod.env", "secrets.env"]:
@@ -417,6 +440,18 @@ class DotenvContentTest(unittest.TestCase):
             out = self.post(cmd, "API_TOKEN=%s" % self.VALUE)
             self.assertNotIn(self.VALUE, repr(out), cmd)
             self.assertIn("dotenv:API_TOKEN", out["hookSpecificOutput"]["updatedToolOutput"]["stdout"], cmd)
+
+    def test_a_glob_that_names_no_env_file_passes_the_name_check_and_the_output_is_redacted(self):
+        # `cat *.local` is not denied by name: nothing in it spells an env file, and denying every
+        # `*.local` or `*.backup` would block ordinary files. The output side is the guarantee, for
+        # the named-environment files with a suffix as for the plain ones. (A failed call is not
+        # redacted by any hook; docs/limits.md.) If the name check ever covers globs, change this test.
+        self.write("prod.env.local", "STRIPE_SECRET=Live-Stripe-" + "Key-5521\n")
+        for cmd in ["cat *.local", "head -3 *.backup", "cat prod.e*"]:
+            self.assertIsNone(hooks.handle("pre", {"tool_name": "Bash", "cwd": self.tmp.name,
+                                                   "tool_input": {"command": cmd}}, STORE), cmd)
+        for shown in ("STRIPE_SECRET=Live-Stripe-" + "Key-5521", "Live-Stripe-" + "Key-5521"):
+            self.assertRedacted(self.post("cat *.local", shown), "Live-Stripe-Key-5521", "dotenv:STRIPE_SECRET")
 
     def test_nested_files_count_but_examples_and_ordinary_values_do_not(self):
         out = self.post("cat app/x", "DB_PASSWORD=another-" + "Secret-Value-77")

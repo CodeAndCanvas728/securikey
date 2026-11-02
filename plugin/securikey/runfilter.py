@@ -25,6 +25,8 @@ HOLD_MIN = 4096  # characters kept back until more output arrives; more if a sto
 QUIET = 0.25  # seconds without output after which every complete line is released
 READ_SIZE = 65536
 MAX_HELD = 1 << 20  # a cap on what is held back while waiting for a line that never ends
+LONG_LINE_NOTICE = "[securikey: a line over 1 MB was withheld]"
+LINE_BREAK = re.compile(r"[\r\n]")
 # Any armor header that names a private key; the same form as redact.PEM_RE, so one fix covers both.
 PEM_BEGIN = re.compile(r"-----BEGIN +" + PEM_HEADER)
 PEM_END = re.compile(r"-----END +" + PEM_HEADER)
@@ -46,6 +48,7 @@ class StreamFilter:
         # unchanged instead of being replaced.
         self.decoder = codecs.getincrementaldecoder("utf-8")(errors="surrogateescape")
         self.buf = ""
+        self.skipping = False  # inside a line that was withheld for its length: its rest is dropped
         self.in_pem = False
         self.pem_tail = ""
 
@@ -94,7 +97,14 @@ class StreamFilter:
 
     def _release(self, final=False, quiet=False):
         text, self.buf = self.buf, ""
-        text, _ = redact(text, known=self.known)
+        if self.skipping:
+            text = self._drop_rest_of_line(text)
+            if not text:
+                return
+        # Stored values are replaced in everything held. The patterns run only on what is released, which
+        # ends at a line break (see below): a pattern of unbounded length (a JWT) matched on a token that is
+        # still arriving would redact its start and let the rest through.
+        text, _ = redact(text, known=self.known, patterns=False)
         if final:
             cut = len(text)
         elif quiet:
@@ -102,26 +112,58 @@ class StreamFilter:
             if self.multiline:
                 cut = min(cut, max(0, len(text) - self.hold))
         else:
-            cut = max(0, len(text) - self.hold)
-        if len(text) - cut > MAX_HELD:  # one endless line: release all but the hold-back
-            cut = len(text) - self.hold
+            # Release only whole lines older than the hold-back: no pattern spans a line break, so a
+            # token longer than the hold-back (a large JWT) is never written out in pieces.
+            limit = max(0, len(text) - self.hold)
+            cut = max(text.rfind("\n", 0, limit), text.rfind("\r", 0, limit)) + 1
+        if len(text) - cut > MAX_HELD:
+            # One line too long to hold. Releasing a prefix could cut a token (a JWT has no length limit)
+            # and print its start unredacted, so the line is withheld: a notice stands in for it, and the
+            # rest of it is dropped as it arrives (see `skipping`).
+            if cut:
+                self.write(redact(text[:cut], known=(), patterns=True)[0])
+            self.write(LONG_LINE_NOTICE)
+            self.skipping = True
+            self.buf = self._drop_rest_of_line(text[cut:])
+            return
         if cut:
-            self.write(text[:cut])
+            self.write(redact(text[:cut], known=(), patterns=True)[0])
         self.buf = text[cut:]
+
+    def _drop_rest_of_line(self, text):
+        """What is left of text after the rest of the withheld line, which ends at the first line break."""
+        end = LINE_BREAK.search(text)
+        if end is None:
+            return ""
+        self.skipping = False
+        return text[end.start():]
 
 
 def _pump(pipe, flt):
-    fd = pipe.fileno()
-    while True:
-        ready, _, _ = select.select([fd], [], [], QUIET)
-        if not ready:
-            flt.quiet()
-            continue
-        data = os.read(fd, READ_SIZE)
-        if not data:
-            break
-        flt.feed(data)
-    flt.finish()
+    try:
+        fd = pipe.fileno()
+        while True:
+            ready, _, _ = select.select([fd], [], [], QUIET)
+            if not ready:
+                flt.quiet()
+                continue
+            data = os.read(fd, READ_SIZE)
+            if not data:
+                break
+            flt.feed(data)
+        flt.finish()
+    except Exception:
+        # Fail closed: print nothing more from this stream, but never leave the pipe undrained, or the
+        # child blocks on a full pipe and `skey run` hangs. If draining fails too, close the read end so
+        # the child gets a broken pipe instead.
+        try:
+            while os.read(pipe.fileno(), READ_SIZE):
+                pass
+        except Exception:
+            try:
+                pipe.close()
+            except Exception:
+                pass
 
 
 def _sink(stream):
