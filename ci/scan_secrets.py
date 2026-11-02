@@ -17,7 +17,7 @@ PATTERNS = [
     r"\b[rs]k_live_[A-Za-z0-9]{20,}",
     r"\bAIza[A-Za-z0-9_-]{35}\b",
     r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
-    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----",
+    r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----",
 ]
 CHUNK = 1 << 20
 OVERLAP = 4096

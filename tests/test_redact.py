@@ -3,7 +3,7 @@ import time
 import unittest
 import urllib.parse
 
-from securikey.redact import _signature, find, known_forms, redact, redact_obj
+from securikey.redact import PEM_RE, _signature, find, known_forms, redact, redact_obj
 
 # The fakes below are assembled from parts, so that the file itself does not
 # contain a string the CI secret scan would flag. The CI scans every file.
@@ -38,6 +38,20 @@ class PatternTest(unittest.TestCase):
         self.assertEqual(find("-eyJ" * 100000, {}), [])
         self.assertLess(time.monotonic() - start, 1)
         self.assertEqual(find("token=" + JWT, {}), ["jwt"])
+
+    def test_the_private_key_patterns_are_linear_on_a_long_run_of_the_literal(self):
+        # A character class that could also match "PRIVATE KEY" made this quadratic: 93 KB took 1 s.
+        import re
+        from securikey import runfilter
+        run = "PRIVATE KEY " * 40000  # 480 KB
+        for rx, text in ((re.compile(PEM_RE), "-----BEGIN " + run), (runfilter.PEM_BEGIN, "-----BEGIN " + run),
+                         (runfilter.PEM_END, "-----END " + run)):
+            start = time.monotonic()
+            rx.search(text)
+            self.assertLess(time.monotonic() - start, 1, rx.pattern[:30])
+        start = time.monotonic()
+        find("-----BEGIN " + run, {})
+        self.assertLess(time.monotonic() - start, 2)
 
     def test_every_private_key_armor_header_is_found(self):
         for label in ("RSA PRIVATE KEY", "EC PRIVATE KEY", "ENCRYPTED PRIVATE KEY", "SSH2 ENCRYPTED PRIVATE KEY",

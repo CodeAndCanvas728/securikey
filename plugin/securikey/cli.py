@@ -111,6 +111,7 @@ def cmd_run(args, store, exec_fn=os.execvpe):
         names.add(name)
         variables.add(var)
     client = None
+    fetched = {}
     for pair in args.env_from_paperclip:
         var, _, key = pair.partition("=")
         if not var or not key:
@@ -121,14 +122,16 @@ def cmd_run(args, store, exec_fn=os.execvpe):
             print("skey: the value of %s is under %d characters, so it will not be redacted"
                   % (key, MIN_SECRET_LEN), file=sys.stderr)
         else:
-            # Registered before the command starts, so the hooks redact it from the first output.
+            # Registered before the command starts, so the hooks redact it from the first output; and kept
+            # here too, so this run's own filter does not depend on reading the watch list back.
             store.add_watch("paperclip:%s" % key, value, PAPERCLIP_VALUE_TTL)
+            fetched["paperclip:%s" % key] = value
         env[var] = value
         names.add("paperclip:%s" % key)
         variables.add(var)
     audit.record(store.service, "run", names, variables, command)
     if exec_fn is os.execvpe and _filter_output():
-        return runfilter.run(command, env, known_forms(_redaction_set(store, secrets)))
+        return runfilter.run(command, env, known_forms(_redaction_set(store, secrets, fetched)))
     exec_fn(command[0], command, env)
 
 
@@ -143,9 +146,10 @@ def _filter_output():
         return True
 
 
-def _redaction_set(store, secrets):
-    """Everything the hooks would redact that this process can name: the stored secrets and the watched
-    values (a rotated-out value, a value fetched from Paperclip)."""
+def _redaction_set(store, secrets, fetched=None):
+    """Everything the hooks would redact that this process can name: the stored secrets, the watched
+    values (a rotated-out value) and the values this run fetched from Paperclip, which are held in memory
+    so an unreadable watch list cannot drop them."""
     try:
         watched = store.load_watch()
     except VaultError as exc:
@@ -154,7 +158,7 @@ def _redaction_set(store, secrets):
         print("skey: the watch list could not be read (%s), so values rotated out or fetched from Paperclip "
               "are not redacted from this command's output; the stored secrets still are" % exc, file=sys.stderr)
         watched = {}
-    return {**watched, **secrets}
+    return {**watched, **(fetched or {}), **secrets}
 
 
 def _free_name(key, value, secrets):

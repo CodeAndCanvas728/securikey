@@ -118,9 +118,19 @@ class PreToolUseTest(unittest.TestCase):
         for name in [".environment", "environment.md", "config.json", ".envrc.example"]:
             self.assertFalse(hooks.DOTENV_NAME_RE.match(name) and not hooks.SAFE_ENV_RE.fullmatch(name), name)
 
+    def test_names_with_repeated_or_mixed_separators_are_checked(self):
+        for name in (".env--local", ".env__prod", ".env._secret", ".env-_x", ".env.-x", ".env.local--old",
+                     ".env.a_-b", ".envrc__x"):
+            self.assertTrue(denied(hooks.handle("pre", bash("cat " + name), STORE)), name)
+            read = {"tool_name": "Read", "tool_input": {"file_path": "/p/" + name}}
+            self.assertTrue(denied(hooks.handle("pre", read, STORE)), name)
+            self.assertTrue(hooks.DOTENV_NAME_RE.match(name), name)  # the content scan reads it too
+        self.assertIsNone(hooks.handle("pre", bash("cat .env--prod.example"), STORE))
+
     def test_the_env_name_patterns_are_linear_on_long_names(self):
         # A body class that also holds `_` and `-` made `.env_a_a_a...!` exponential: 55 characters took 7 s.
-        for text in (".env" + "_a" * 5000 + "!", "cat /x/.env" + "-a" * 5000 + "!", ".envrc" + "_-" * 5000 + "!"):
+        for text in (".env" + "_a" * 5000 + "!", "cat /x/.env" + "-a" * 5000 + "!", ".envrc" + "_-" * 5000 + "!",
+                     ".env" + "_" * 20000 + "!", ".env" + "_-." * 5000 + "!"):
             start = time.monotonic()
             hooks.ENV_FILE_RE.search(text)
             hooks._env_names(text)

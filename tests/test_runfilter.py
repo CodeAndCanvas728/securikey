@@ -184,6 +184,14 @@ class WhenItFiltersTest(unittest.TestCase):
         self.assertIn("watch list could not be read", err.getvalue())
         self.assertNotIn(SECRET, err.getvalue())
 
+    def test_a_value_fetched_from_paperclip_is_redacted_even_if_the_watch_list_cannot_be_read(self):
+        store = MemoryStore({"deploy_key": SECRET})
+        fetched = {"paperclip:api": "Fetched-From-Paperclip-77"}
+        with mock.patch.object(store, "load_watch", side_effect=VaultError("locked")), \
+                mock.patch("sys.stderr", io.StringIO()), mock.patch.dict(os.environ, {"SECURIKEY_HEADLESS": ""}):
+            names = cli._redaction_set(store, store.load(), fetched)
+        self.assertEqual(names, {"paperclip:api": "Fetched-From-Paperclip-77", "deploy_key": SECRET})
+
     def test_an_unreadable_watch_list_fails_closed_when_headless(self):
         store = MemoryStore({"deploy_key": SECRET})
         with mock.patch.object(store, "load_watch", side_effect=VaultError("locked")), \

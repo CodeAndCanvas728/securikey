@@ -21,11 +21,11 @@ from securikey.store import VaultError, is_headless
 # extension (`prod.env`, `secrets.env`). The prefixed form is a short list, not any word: `process.env` is code.
 ENV_FILE_RE = re.compile(
     r"(?:^|[\s/\"'=<:*$(){},])"
-    r"(\.env(?:rc)?(?:[._-][A-Za-z0-9*]+)*"  # `_` and `-` only separate: a body class holding them is exponential
+    r"(\.env(?:rc)?(?:[._-]+[A-Za-z0-9*]+)*"  # a run of separators, then a body that cannot hold them: linear
     r"|(?:prod(?:uction)?|dev(?:elopment)?|stag(?:e|ing)|test|local|live|secrets?|credentials?)\.env)"
     r"(?=$|[\s\"';|&)>*?$(),=])", re.IGNORECASE)
 # An example file, also as a suffix (`.env.local.example`), the same rule the scan script uses.
-SAFE_ENV_RE = re.compile(r"(?:[A-Za-z0-9_-]+)?\.env(?:rc)?(?:[._-][A-Za-z0-9]+)*\.(?:example|sample|template|dist)\b",
+SAFE_ENV_RE = re.compile(r"(?:[A-Za-z0-9_-]+)?\.env(?:rc)?(?:[._-]+[A-Za-z0-9]+)*\.(?:example|sample|template|dist)\b",
                          re.IGNORECASE)
 # The names the content scan reads: `.env` and anything after a dot. A name the plain .env
 # pattern doesn't cover (`.env.prod~`) still holds secrets, so it is read too.

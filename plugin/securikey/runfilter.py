@@ -19,15 +19,15 @@ import subprocess
 import sys
 import threading
 
-from securikey.redact import redact
+from securikey.redact import PEM_HEADER, redact
 
 HOLD_MIN = 4096  # characters kept back until more output arrives; more if a stored form is longer
 QUIET = 0.25  # seconds without output after which every complete line is released
 READ_SIZE = 65536
 MAX_HELD = 1 << 20  # a cap on what is held back while waiting for a line that never ends
-# Any armor header that names a private key (RSA, EC, OPENSSH, ENCRYPTED, SSH2 ENCRYPTED, PGP ... BLOCK).
-PEM_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----")
-PEM_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----")
+# Any armor header that names a private key; the same form as redact.PEM_RE, so one fix covers both.
+PEM_BEGIN = re.compile(r"-----BEGIN " + PEM_HEADER)
+PEM_END = re.compile(r"-----END " + PEM_HEADER)
 PEM_TAIL = 64  # kept while inside a key, so an END line split across two reads is still seen
 
 
