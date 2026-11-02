@@ -17,8 +17,10 @@ MIN_SECRET_LEN = 8  # shorter stored values would redact ordinary words
 # shape by shape: a header means everything after it is redacted.
 # The header is whole words, then the literal (RSA, EC, OPENSSH, SSH2 ENCRYPTED, PGP ... BLOCK). A character
 # class that could also match the literal made a long run of "PRIVATE KEY " quadratic.
-PEM_HEADER = r"(?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"
-PEM_RE = r"-----BEGIN " + PEM_HEADER + r"[\s\S]*?(?:-----END " + PEM_HEADER + r"|$)"
+# Runs of spaces are their own token (` +`), never part of a class that can also match a word, so extra
+# spaces are tolerated and the match stays linear.
+PEM_HEADER = r"(?:[A-Z0-9]+ +)*PRIVATE +KEY(?: +BLOCK)? *-----"
+PEM_RE = r"-----BEGIN +" + PEM_HEADER + r"[\s\S]*?(?:-----END +" + PEM_HEADER + r"|$)"
 
 PATTERNS = {
     "github": r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{50,})",

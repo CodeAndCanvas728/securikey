@@ -26,8 +26,8 @@ QUIET = 0.25  # seconds without output after which every complete line is releas
 READ_SIZE = 65536
 MAX_HELD = 1 << 20  # a cap on what is held back while waiting for a line that never ends
 # Any armor header that names a private key; the same form as redact.PEM_RE, so one fix covers both.
-PEM_BEGIN = re.compile(r"-----BEGIN " + PEM_HEADER)
-PEM_END = re.compile(r"-----END " + PEM_HEADER)
+PEM_BEGIN = re.compile(r"-----BEGIN +" + PEM_HEADER)
+PEM_END = re.compile(r"-----END +" + PEM_HEADER)
 PEM_TAIL = 64  # kept while inside a key, so an END line split across two reads is still seen
 
 

@@ -74,6 +74,14 @@ class StreamFilterTest(unittest.TestCase):
                 self.assertNotIn("QUJDREVG", text, (head, size))
                 self.assertEqual((text[:2], text[-2:]), ("a\n", "b\n"), (head, size))
 
+    def test_a_private_key_with_extra_spaces_in_its_header_is_dropped_across_reads(self):
+        head, end = "-----BEGIN " + " RSA  PRIVATE   KEY -----", "-----END " + "RSA  PRIVATE KEY  -----"
+        data = ("a\n%s\nQUJDREVGR0hJSktMTU5PUA\n%s\nb\n" % (head, end)).encode()
+        for size in (1, 5, len(data)):
+            text = filtered(split(data, size))
+            self.assertNotIn("QUJDREVG", text, size)
+            self.assertEqual((text[:2], text[-2:]), ("a\n", "b\n"), size)
+
     def test_bytes_that_are_not_utf8_come_out_unchanged(self):
         # A binary download on stdout (curl -o -, git archive): the filter must not damage it.
         data = bytes(range(256)) * 40 + b"\xff\xfe\x80 tail"

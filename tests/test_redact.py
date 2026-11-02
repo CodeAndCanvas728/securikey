@@ -1,4 +1,5 @@
 import base64
+import re
 import time
 import unittest
 import urllib.parse
@@ -52,6 +53,27 @@ class PatternTest(unittest.TestCase):
         start = time.monotonic()
         find("-----BEGIN " + run, {})
         self.assertLess(time.monotonic() - start, 2)
+
+    def test_extra_spaces_in_a_private_key_header_do_not_hide_it(self):
+        # Spaces are a token of their own in the pattern, so this stays linear (see the timing test above).
+        run = "PRIVATE  KEY " * 40000
+        start = time.monotonic()
+        find("-----BEGIN " + run, {})
+        self.assertLess(time.monotonic() - start, 2)
+        for begin, end in (("-----BEGIN " + " RSA  PRIVATE   KEY ----- ", "-----END " + " RSA  PRIVATE   KEY -----"),
+                           ("-----BEGIN " + "  PRIVATE KEY-----", "-----END " + "  PRIVATE KEY-----"),
+                           ("-----BEGIN " + "PGP  PRIVATE KEY   BLOCK-----", "-----END " + "PGP  PRIVATE KEY   BLOCK-----")):
+            text = "x %s\nQUJDREVGR0hJSktM\n%s\ny" % (begin, end)
+            self.assertEqual(find(text, {}), ["private_key"], begin)
+            self.assertEqual(redact(text, {})[0], "x [redacted:private_key]\ny", begin)
+
+    def test_the_ci_scan_flags_every_header_the_redactor_treats_as_a_key(self):
+        from ci import scan_secrets
+        for label in ("RSA PRIVATE KEY", "PRIVATE KEY", "SSH2 ENCRYPTED PRIVATE KEY", "PGP PRIVATE KEY BLOCK",
+                      " RSA  PRIVATE   KEY ", "  PRIVATE KEY"):
+            header = "-----BEGIN " + label + "-----"
+            self.assertTrue(any(re.search(rx, header) for rx in scan_secrets.PATTERNS), label)
+        self.assertFalse(any(re.search(rx, "-----BEGIN " + "PGP PUBLIC KEY BLOCK-----") for rx in scan_secrets.PATTERNS))
 
     def test_every_private_key_armor_header_is_found(self):
         for label in ("RSA PRIVATE KEY", "EC PRIVATE KEY", "ENCRYPTED PRIVATE KEY", "SSH2 ENCRYPTED PRIVATE KEY",

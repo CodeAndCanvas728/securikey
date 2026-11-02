@@ -125,7 +125,17 @@ class PreToolUseTest(unittest.TestCase):
             read = {"tool_name": "Read", "tool_input": {"file_path": "/p/" + name}}
             self.assertTrue(denied(hooks.handle("pre", read, STORE)), name)
             self.assertTrue(hooks.DOTENV_NAME_RE.match(name), name)  # the content scan reads it too
-        self.assertIsNone(hooks.handle("pre", bash("cat .env--prod.example"), STORE))
+        self.assertIsNone(hooks.handle("pre", bash("cat .env-prod.example"), STORE))
+
+    def test_an_example_name_with_repeated_separators_is_not_a_safe_example(self):
+        # The allowlist stays at one separator per part: a name with a doubled or mixed run is a real file,
+        # so it is denied by the read gate and read by the content scan.
+        for name in (".env-_prod.example", ".env__prod.example", ".env.local--x.example", ".env.a_-b.sample"):
+            self.assertFalse(hooks.SAFE_ENV_RE.fullmatch(name), name)
+            self.assertTrue(hooks.DOTENV_NAME_RE.match(name) is None or not hooks.SAFE_ENV_RE.fullmatch(name), name)
+            self.assertTrue(denied(hooks.handle("pre", bash("cat " + name), STORE)), name)
+        for name in (".env.example", ".env.local.example", ".env-prod.example", ".envrc.sample", "prod.env.example"):
+            self.assertTrue(hooks.SAFE_ENV_RE.fullmatch(name), name)
 
     def test_the_env_name_patterns_are_linear_on_long_names(self):
         # A body class that also holds `_` and `-` made `.env_a_a_a...!` exponential: 55 characters took 7 s.
