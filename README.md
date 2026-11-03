@@ -4,10 +4,6 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 ![Platforms: macOS and Linux](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-blue)
 
-[![CI](https://github.com/CodeAndCanvas728/securikey/actions/workflows/ci.yml/badge.svg)](https://github.com/CodeAndCanvas728/securikey/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-![Platforms: macOS and Linux](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-blue)
-
 **Keeps API keys and tokens out of Claude's context.** Secrets live in the OS keychain, and the agent only ever works with their **names**. A prompt or tool call that contains a secret is blocked, and tool output is redacted before the model sees it, whenever the call succeeds or the command was started with `skey run`.
 
 One gap, stated up front: if a command that did **not** get its secret through `skey run` fails (non-zero exit), Claude Code skips the redaction hook and the model sees what it printed. [Details and what covers it](#known-gap-a-failing-command).
