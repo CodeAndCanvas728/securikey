@@ -156,6 +156,16 @@ def configured(secrets, environ):
                 and (secrets.get(TOKEN_NAME) or environ.get(TOKEN_ENV)))
 
 
+def in_use(secrets, environ):
+    """Whether any Paperclip setting is present, even a partial set.
+
+    A person with no setting at all does not use Paperclip and is told nothing about it; one with some
+    settings but not all (a URL and no token) wants it and must hear that it was not updated.
+    """
+    return bool(environ.get(URL_ENV) or environ.get(COMPANY_ENV) or environ.get(TOKEN_ENV)
+                or secrets.get(TOKEN_NAME))
+
+
 def board_client(secrets, environ):
     """(Client, company id) for sync and rotate. Settings come from the environment and the
     keychain, never from arguments (they would land in shell history and `ps`)."""

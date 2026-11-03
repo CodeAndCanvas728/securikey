@@ -424,9 +424,10 @@ def cmd_rotate(args, store):
     print("rotated %s; %s" % (name, "the old value stays redacted for %d day(s)" % args.keep_days if retired
                                else "the old value is not kept in the redaction set"))
     audit.record(store.service, "rotate", [name], ())
-    if not paperclip.configured(secrets, os.environ):
-        print("Paperclip is not configured: only the keychain changed")
-        return
+    if not paperclip.in_use(secrets, os.environ):
+        return  # most installs do not use Paperclip: nothing to report
+    # A partial set of settings falls through: board_client names what is missing and the except below
+    # says the keychain changed but Paperclip did not.
     try:
         # Inside the try: a bad Paperclip address must not hide that the keychain already has the new value.
         client, company = paperclip.board_client(secrets, os.environ)

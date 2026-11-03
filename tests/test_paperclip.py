@@ -391,13 +391,23 @@ class RotateTest(PaperclipCase):
         store.add_watch("retired:x", OLD, -1)
         self.assertEqual(store.load_watch(), {})
 
+    def test_partial_paperclip_settings_are_reported_after_the_keychain_changed(self):
+        os.environ.pop(paperclip.COMPANY_ENV)  # the URL is set, the company and token are not
+        store = MemoryStore({"api_key": OLD})
+        code, _, err = run_cli(["rotate", "api_key"], store, stdin=NEW)
+        self.assertEqual((code, store.secrets["api_key"]), (1, NEW))
+        self.assertIn("keychain has the new value", err)
+        self.assertIn("Paperclip is not configured", err)
+        self.assertEqual(self.server.requests, [])
+
     def test_without_paperclip_settings_only_the_keychain_changes(self):
         os.environ.pop(paperclip.URL_ENV)
+        os.environ.pop(paperclip.COMPANY_ENV)
         store = MemoryStore({"api_key": OLD})
         code, out, _ = run_cli(["rotate", "api_key", "--keep-days", "0"], store, stdin=NEW)
         self.assertIn("not kept in the redaction set", out)
         self.assertEqual((code, store.secrets["api_key"], store.load_watch()), (0, NEW, {}))
-        self.assertIn("only the keychain changed", out)
+        self.assertNotIn("Paperclip", out)  # a user without Paperclip is told nothing about it
         self.assertEqual(self.server.requests, [])
 
     def test_a_failed_paperclip_update_is_reported_after_the_keychain_changed(self):

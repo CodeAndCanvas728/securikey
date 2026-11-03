@@ -1,6 +1,11 @@
 # Changelog
 
-## [Unreleased]
+## [3.1.3] - 2026-11-03
+
+### Changed
+- `skey rotate` no longer prints "Paperclip is not configured: only the keychain changed" when Paperclip is not set up. Most installs do not use it, so the message was noise on every rotate. It stays silent only when no Paperclip setting exists at all: with some settings but not all (a URL and no token), rotate still says the keychain changed but Paperclip did not, and exits 1. With Paperclip configured, the messages for a secret that is not there yet and for a failed update are unchanged.
+
+## [3.1.2] - 2026-11-03
 
 ### Changed
 - The pre-hook gate for the human-only commands no longer denies ordinary text. A word with a glob or expansion character (`$ * ? [ ~` or a backtick) directly before `sync` or `rotate` is read as an unknown program only in command position (the first word of a line or segment, or any word after a wrapper such as `env`, `sudo`, `xargs`, `uv`, `docker`, `bash -c` or a bare `--`), so a bullet such as `- **Open:** sync the plan` or `- [ ] sync it` passes. A line that starts with such a word is still judged as a command. The `skey <word>` rules are unchanged.
