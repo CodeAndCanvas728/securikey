@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- The pre-hook gate for the human-only commands no longer denies ordinary text. A word with a glob or expansion character (`$ * ? [ ~` or a backtick) directly before `sync` or `rotate` is read as an unknown program only in command position (the first word of a line or segment, or any word after a wrapper such as `env`, `sudo`, `xargs`, `uv`, `docker`, `bash -c` or a bare `--`), so a bullet such as `- **Open:** sync the plan` or `- [ ] sync it` passes. A line that starts with such a word is still judged as a command. The `skey <word>` rules are unchanged.
+- The denial names what matched (for example `` `$S` before `sync` ``), so a false positive can be fixed in one step.
+
 ## [3.1.1] - 2026-11-02
 
 Security review and publication prep. The headline is now honest about one gap (a failing command), and `skey run` closes it for the commands it starts.

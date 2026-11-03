@@ -45,6 +45,14 @@ TV_METADATA = {"import", "add", "rm", "list", "warm", "patterns", "doctor", "mig
 HUMAN_ONLY = {"sync", "rotate"}
 MAX_BRACE_SCAN_CHARS = 16384
 MAX_BRACE_PASSES = 64  # brace nesting the gate expands; deeper is denied
+# A word after one of these is the program it runs: `env $S sync`, `bash -c "$S sync"`, `if $S sync`.
+COMMAND_WRAPPERS = {"env", "sudo", "doas", "command", "builtin", "exec", "eval", "xargs", "nohup", "time",
+                    "nice", "timeout", "stdbuf", "if", "then", "else", "elif", "do", "while", "until", "!", "-c",
+                    "setsid", "ionice", "chrt", "taskset", "caffeinate", "unbuffer", "flock", "watch", "strace",
+                    "ltrace", "script", "chroot", "runuser", "su", "arch", "setpriv", "parallel", "find",
+                    "-exec", "-execdir", "-ok", "-okdir",
+                    "npx", "uv", "uvx", "pnpm", "bunx", "yarn", "ssh", "docker", "make", "mise", "direnv",
+                    "skey", "bash", "sh", "zsh", "--"}  # `--`: launchers such as `op run -- $S ...`
 # skey's own options, and the value each one takes.
 TV_RUN_OPTIONS = {"--env": 1, "--dotenv": 1, "--env-from-paperclip": 1}
 # A command that changes the directory, so a relative path is not resolvable.
@@ -592,8 +600,28 @@ def _unquoted(word):
     return re.sub(r"[\"'\\]", "", word)
 
 
+def _command_positions(words):
+    """The indexes of the words that can name a program: the first, and every word after a wrapper.
+
+    A word in the middle of prose (`- **Open:** sync the plan`) is not a program. After a wrapper such as
+    `sudo` every later word counts, because its options take arguments (`sudo -u root $S`, `exec -a x $S`)
+    and the program is not at a fixed offset.
+    """
+    positions, wrapped = set(), False
+    for index, word in enumerate(words):
+        if index == 0 or wrapped:
+            positions.add(index)
+        if word.rsplit("/", 1)[-1].lower() in COMMAND_WRAPPERS:
+            wrapped = True
+    return positions
+
+
+def _clip(word):
+    return word if len(word) <= 40 else word[:40] + "..."
+
+
 def _runs_human_only(command):
-    """Whether a Bash command runs `skey sync` or `skey rotate`.
+    """The reason (truthy) when a Bash command runs `skey sync` or `skey rotate`.
 
     Also when nested (`skey run -- skey sync`, `bash -c "skey sync"`, `$(skey sync)`), run by path, glued to
     a separator (`true &skey rotate k`, `{ skey sync; }`), written with shell quoting (`s''key`), or
@@ -603,7 +631,7 @@ def _runs_human_only(command):
     terminal (cli.require_terminal), because a pattern match on shell text is never complete.
     """
     if not isinstance(command, str):
-        return False
+        return None
     # The command as written; with each `$(...)` / backtick substitution replaced by a placeholder
     # (`$(echo skey) sync` has no `skey` next to `sync`, but `$SUB sync` is a word that can be anything);
     # and with brace lists and $IFS read as the shell does (`{skey,sync}`, `skey${IFS}sync`).
@@ -612,13 +640,13 @@ def _runs_human_only(command):
     # name this gate guards.
     lowered = command.lower()
     if "${" in command and ("skey" in lowered or re.search(r"\b(?:%s)\b" % "|".join(HUMAN_ONLY), lowered)):
-        return True
+        return "`${` next to skey, sync or rotate"
     braced = command
     if len(command) > MAX_BRACE_SCAN_CHARS:
         # The brace regex below is quadratic in an unclosed run of `{`. A command this long that names a
         # guarded word is not judged; one that does not cannot build the word from a brace list.
         if "skey" in lowered or re.search(r"\b(?:%s)\b" % "|".join(HUMAN_ONLY), lowered):
-            return True
+            return "a command over %d characters that names skey, sync or rotate" % MAX_BRACE_SCAN_CHARS
     else:
         for _ in range(MAX_BRACE_PASSES):  # innermost first: `{skey,{sync,x}}`; each pass removes a brace pair
             again = re.sub(r"\{([^{}]*,[^{}]*)\}", lambda m: m.group(1).replace(",", " "), braced)
@@ -626,7 +654,7 @@ def _runs_human_only(command):
                 break
             braced = again
         else:
-            return True  # nested deeper than any real command: not a fixed point, so not judged safe
+            return "braces nested deeper than %d" % MAX_BRACE_PASSES  # not a fixed point, so not judged safe
     # Any parameter expansion (`${IFS}`, `${IFS:0:1}`, `${IFS%?}`, `$IFS`) becomes its own dynamic word, so
     # `skey${IFS:0:1}sync` reads as `skey $X sync`: a subcommand that is not known.
     spaced = re.sub(r"\$\{[^{}]*\}|\$IFS\b", " $X ", braced)
@@ -634,18 +662,22 @@ def _runs_human_only(command):
         for segment in re.split(r"&&|\|\||[;|&\n(){}]", text):
             for part in [segment] + _substitutions(segment):
                 words = [_unquoted(w.strip("`")) for w in _words(part)]
-                for word, following in zip(words, words[1:]):
+                positions = _command_positions(words)
+                for index, (word, following) in enumerate(zip(words, words[1:])):
                     # What follows the last `=`, `!` or `:` is the program: `alias.x=!skey`, `--pre=skey`.
                     # Lower case: the default macOS filesystem is case-insensitive, so `SKEY sync` runs.
                     program = re.split(r"[=!:]", word)[-1].rsplit("/", 1)[-1].lower()
                     sub = following.rsplit("/", 1)[-1].lower()
-                    dynamic_word = any(c in word for c in "$*?[`~")
+                    # Only a word that names the program: in command position, or after `=` / `!`
+                    # (`--pre=$S`, `alias.x=!$S`). Not `:`, so `**Open:** sync` is prose.
+                    tail = re.split(r"[=!]", word)[-1]
+                    dynamic_word = any(c in tail for c in "$*?[`~") and (index in positions or tail != word)
                     dynamic_sub = any(c in sub for c in "$*?[`~")
                     if program == "skey" and (sub in HUMAN_ONLY or dynamic_sub):
-                        return True  # `skey sync`, and `skey $X`: the subcommand is not known
+                        return "`%s %s`" % (_clip(program), _clip(sub))  # `skey sync`, `skey $X`
                     if sub in HUMAN_ONLY and dynamic_word:
-                        return True  # `$S sync`: the program is not known
-    return False
+                        return "`%s` before `%s`, a program that is not known" % (_clip(word), sub)
+    return None
 
 
 def _is_tv_run(segment):
@@ -769,10 +801,12 @@ def pre_tool_use(event, secrets):
     if found:
         return _deny("securikey: this tool call contains a secret (%s). Refer to secrets by name and let "
                      "`skey run --env VAR=<name> -- <command>` inject them." % ", ".join(found))
-    if tool == "Bash" and _runs_human_only(tool_input.get("command")):
+    matched = _runs_human_only(tool_input.get("command")) if tool == "Bash" else None
+    if matched:
         return _deny("securikey: `skey sync` and `skey rotate` send secret values to a server, and the "
                      "address can be set on the command line, so you run them in your own terminal, "
-                     "not the agent.")
+                     "not the agent. (Matched: %s. In written text, describe the command instead of "
+                     "quoting it.)" % matched)
     if _reads_env_file(tool, tool_input, cwd=event.get("cwd")):
         return _deny("securikey: reading .env files puts secret values in the transcript. Run "
                      "`skey import <file>` once (values move to the keychain, the file keeps names), then "

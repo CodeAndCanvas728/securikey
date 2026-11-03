@@ -598,6 +598,31 @@ class HumanOnlyCommandsTest(unittest.TestCase):
             out = self.verdict(command)
             self.assertTrue(out and out["hookSpecificOutput"]["permissionDecision"] == "deny", command)
 
+    def test_prose_before_sync_or_rotate_passes(self):
+        lines = ("- **Open:** sync the plan", "- **Open:** rotate it", "- Open: x* sync the plan",
+                 "- Open: sync the plan", "- _Open:_ sync the plan", "- [ ] sync the plan", "- Done? sync",
+                 "- ~ sync", "- $5 sync", "we should sync the plan, the key will rotate tomorrow, "
+                 "the mirror-sync timer")
+        for line in lines:
+            self.assertIsNone(self.verdict("cat <<'EOF'\n%s\nEOF" % line), line)
+            self.assertIsNone(self.verdict('echo "%s"' % line), line)
+
+    def test_dynamic_program_in_command_position_is_denied(self):
+        for command in ("$S sync", "s*y sync", "env $S sync", "sudo $S rotate k", 'bash -c "$S sync"',
+                        "x && $S sync", "if $S sync; then :; fi", "xargs -0 $S sync", "timeout 5 $S sync",
+                        "S=skey; setsid $S sync", "uv run $S sync", "npx $S sync", "docker exec x $S sync",
+                        "skey run -- $S sync", "bash $S sync", "op run -- $S sync", "dotenvx run -- $S rotate k", "env -u X $S sync", "sudo -u root $S sync",
+                        "timeout -s KILL 5 $S sync", "stdbuf -o L $S sync", "exec -a x $S sync", "ionice -c3 $S rotate k", "find . -exec $S sync {} ;",
+                        "git -c alias.x='!$S sync' x", "rg --pre=$S sync", "skey ${IFS} sync", "{skey,sync}"):
+            out = self.verdict(command)
+            self.assertTrue(out and out["hookSpecificOutput"]["permissionDecision"] == "deny", command)
+
+    def test_denial_names_the_matched_token(self):
+        reason = lambda c: self.verdict(c)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("`$S` before `sync`", reason("$S sync"))
+        self.assertIn("`skey sync`", reason("skey sync paperclip"))
+        self.assertIn("your own terminal", reason("$S sync"))
+
     def test_nesting_past_the_bound_is_denied_not_judged(self):
         deep = "{a," * 80 + "x" + "}" * 80 + " hello"
         out = self.verdict(deep)
