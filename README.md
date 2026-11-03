@@ -1,4 +1,8 @@
-# SecuriKey
+<h1 align="center"><img src="docs/logo.svg" alt="SecuriKey" width="360"></h1>
+
+[![CI](https://github.com/CodeAndCanvas728/securikey/actions/workflows/ci.yml/badge.svg)](https://github.com/CodeAndCanvas728/securikey/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+![Platforms: macOS and Linux](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-blue)
 
 [![CI](https://github.com/CodeAndCanvas728/securikey/actions/workflows/ci.yml/badge.svg)](https://github.com/CodeAndCanvas728/securikey/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
