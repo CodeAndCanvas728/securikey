@@ -20,6 +20,7 @@ Secrets live in the OS keychain. You work with their **names**; values reach onl
 | Run with a project's .env | `skey run --dotenv .env -- npm run dev` |
 | Make a .env safe to commit | `skey import .env` (values move to the keychain; the file keeps `securikey:<name>`), `--dry-run` first |
 | Remove a secret | `skey rm <name>` |
+| A stored value that is configuration, not a secret (a local server address) and keeps getting blocked | the user runs `skey add --config <name>`, or `skey config <name> on` for an entry that exists, in their own terminal (they refuse to run from you: a marked value is no longer redacted). `skey list` shows `(config)`. Storing a new value makes it a secret again |
 | Replace a secret's value | the user runs `skey rotate <name>` in their own terminal (the old value stays redacted for 7 days) |
 | Create the keychain's names in Paperclip | the user runs `skey sync paperclip` in their own terminal (a hook refuses `skey sync` and `skey rotate` from you: they send values to a server) |
 | Use a secret Paperclip granted this run | `skey run --env-from-paperclip VAR=key -- <command>` |

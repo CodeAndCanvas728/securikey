@@ -88,6 +88,53 @@ class PreToolUseTest(unittest.TestCase):
         self.assertIsNone(hooks.handle(
             "pre", {"tool_name": "Read", "cwd": CWD, "tool_input": {"file_path": "/p/.env.example"}}, STORE))
 
+    def test_naming_an_env_file_in_text_is_not_a_read(self):
+        allowed = ['echo "copy .env first"', "printf '%s\\n' 'see the .env section'",
+                   'git commit -m "docs: why .env stays out of the repo"', 'rg -n ".env" plugin/',
+                   'grep -rn ".env" README.md', "rg -e '.env' src", "rg -n -- '.env' src",
+                   "cat <<EOF > notes.md\nNever commit .env files.\nEOF",
+                   "cat <<'EOF' > notes.md\nNever commit .env files: $(cat .env)\nEOF",
+                   "git commit -F - <<'EOF'\nTitle\n\nDo not read .env\nEOF"]
+        for cmd in allowed:
+            self.assertIsNone(hooks.handle("pre", bash(cmd), STORE), cmd)
+
+    def test_reading_an_env_file_is_still_denied_next_to_a_mention(self):
+        denied_cmds = ["cat .env", "rg x .env", "rg -f .env x", "rg -g .env x .", "rg --pre=.env x",
+                       "grep -rn KEY .env", "rg -e KEY .env", "echo .env | xargs cat", "printf '.env\n' | xargs cat",
+                       "echo $(cat .env)", "echo .env; read f < <(echo .env)", "echo hi < .env | cat",
+                       "git commit -F .env", "git commit --file=.env", "git -c core.x=y show HEAD:.env",
+                       "git show HEAD:.env", "git log -p .env",
+                       "cat <<EOF > notes.md\nNever commit .env: $(cat .env)\nEOF",
+                       "cat <<EOF\nnote\nEOF\ncat .env",
+                       "bash <<EOF\ncat .env\nEOF", "sh <<'EOF'\ncat .env\nEOF", "python3 - <<'EOF'\nopen('.env')\nEOF",
+                       "cat <<EOF | bash\ncat .env\nEOF", "cat <<EOF; cat .env\nnote\nEOF",
+                       "cat <<EOF > notes.md\nnote .env\n",  # a heredoc with no closing line is judged as written
+                       # text written to a file can be run next
+                       "echo 'cat .env' > s.sh && bash s.sh", "printf 'cat .env\\n' > s.sh; sh s.sh",
+                       "echo 'cat .env' >> run.sh",
+                       # a single & starts another command in the same segment
+                       "echo ok & cat .env", "git commit -m x & cat .env", "echo x & cat .env.local",
+                       "rg x src & cat .env", "echo ok & (cat .env)", "echo ok & { cat .env; }",
+                       # a `<<` that is not a heredoc: in quotes, after a backslash or a comment, or a second one
+                       "cat '<<X' > /dev/null\ncat .env\nX", 'cat "<<X"\ncat .env\nX', "cat \\<<X\ncat .env\nX",
+                       "cat # <<X\ncat .env\nX", "cat <<A <<B\ncat .env\nA\nB",
+                       # git reads names from stdin, and abbreviates long options
+                       "git cat-file --batch <<'EOF'\nHEAD:.env\nEOF",
+                       "git add --pathspec-from-file=- <<'EOF'\n.env\nEOF",
+                       "git commit --fil=.env", "git commit --templ=.env -m x", "git commit --reu=HEAD -m .env",
+                       "git commit -F .env", "git commit -m x -F .env",
+                       # quoted or escaped, the shell still passes the option
+                       'git commit "--file=.env"', 'git commit "-F" .env', "git commit \\-F .env",
+                       "git commit '-t' .env", "git commit '--fil=.env'", "git commit -m x $OPT .env",
+                       "git cat-file \"--batch\" <<'EOF'\nHEAD:.env\nEOF", "git cat-file <<'EOF'\nHEAD:.env\nEOF",
+                       "rg $'--pre=.env' x src", "rg $OPT .env", "rg '.env$' src",
+                       "rg '--pre=.env' x src", 'rg "--file=.env" x', "rg '-f' .env x", "grep '--file=.env' x"]
+        for cmd in ["git commit -m 'why .env stays out' --allow-empty", "git commit -am 'about .env'",
+                    "git commit -mabout-.env", "git commit -F - <<'EOF'\nabout .env\nEOF"]:
+            self.assertIsNone(hooks.handle("pre", bash(cmd), STORE), cmd)
+        for cmd in denied_cmds:
+            self.assertTrue(denied(hooks.handle("pre", bash(cmd), STORE)), cmd)
+
     def test_a_shell_substitution_cannot_smuggle_a_read(self):
         # The allowlist covers the command that is written, not the one the
         # shell runs after an expansion.

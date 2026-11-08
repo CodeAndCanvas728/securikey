@@ -9,13 +9,14 @@ Messages name what was found (secret names, token kinds); they never contain a v
 import heapq
 import os
 import re
+import shlex
 import stat
 import sys
 from pathlib import Path
 
 from securikey import dotenv
 from securikey.redact import MIN_SECRET_LEN, find, known_forms, redact_obj
-from securikey.store import VaultError, is_headless
+from securikey.store import VaultError, config_names, is_headless
 
 # `.env`, `.envrc`, `.env.local`, `.env-prod`, `.env_local`, and a named environment in front of the
 # extension (`prod.env`, `secrets.env`). The prefixed form is a short list, not any word: `process.env` is code.
@@ -24,7 +25,7 @@ ENV_FILE_RE = re.compile(
     r"(\.env(?:rc)?(?:[._-]+[A-Za-z0-9*]+)*"  # a run of separators, then a body that cannot hold them: linear
     r"|(?:prod(?:uction)?|dev(?:elopment)?|stag(?:e|ing)|test|local|live|secrets?|credentials?)\.env"
     r"(?:[._-]+[A-Za-z0-9*]+)*)"  # and a suffix after it (`prod.env.local`, `live.env.backup`)
-    r"(?=$|[\s\"';|&)>*?$(),=])", re.IGNORECASE)
+    r"(?=$|[\s\"';|&)>*?$(),=\\])", re.IGNORECASE)  # a backslash ends it: `printf 'cat NAME\n'`
 # An example file, also as a suffix (`.env.local.example`), the same rule the scan script uses.
 SAFE_ENV_RE = re.compile(r"(?:[A-Za-z0-9_-]+)?\.env(?:rc)?(?:[._-][A-Za-z0-9]+)*\.(?:example|sample|template|dist)\b",
                          re.IGNORECASE)
@@ -616,6 +617,22 @@ def _command_positions(words):
     return positions
 
 
+def _is_dynamic(word):
+    """Whether the shell could expand the word into a program name this gate guards.
+
+    An expansion, backtick, `~`, bracket class or path makes the word unknowable. A word that only has `*`
+    and `?` globs (`**Open:**`, a bold label in prose) can become `skey` only if its literal characters are an
+    ordered subsequence of it, so a label such as `Open:` is not a program.
+    """
+    if any(c in word for c in "$[`~^#"):  # `^` and `#` are zsh extended-glob operators (`s*^y`)
+        return True
+    base = word.rsplit("/", 1)[-1]  # only the last part names the program: `./scripts/tool` is a plain path
+    if "*" not in base and "?" not in base:
+        return False
+    rest = iter("skey")
+    return all(c in rest for c in base.lower() if c not in "*?")
+
+
 def _clip(word):
     return word if len(word) <= 40 else word[:40] + "..."
 
@@ -671,13 +688,156 @@ def _runs_human_only(command):
                     # Only a word that names the program: in command position, or after `=` / `!`
                     # (`--pre=$S`, `alias.x=!$S`). Not `:`, so `**Open:** sync` is prose.
                     tail = re.split(r"[=!]", word)[-1]
-                    dynamic_word = any(c in tail for c in "$*?[`~") and (index in positions or tail != word)
+                    dynamic_word = _is_dynamic(tail) and (index in positions or tail != word)
                     dynamic_sub = any(c in sub for c in "$*?[`~")
                     if program == "skey" and (sub in HUMAN_ONLY or dynamic_sub):
                         return "`%s %s`" % (_clip(program), _clip(sub))  # `skey sync`, `skey $X`
+                    # Marking an entry as configuration stops it being redacted, so an agent that could do it
+                    # (through its own pseudo-terminal, which the terminal check does not stop) could then
+                    # print a real secret. Only the literal commands: `config` is a common word elsewhere.
+                    if program == "skey" and (sub == "config" or (
+                            sub == "add" and any(w == "--config" or w.startswith("--config=")
+                                                 for w in words[index + 2:]))):
+                        return "`skey %s`" % ("config" if sub == "config" else "add --config")
                     if sub in HUMAN_ONLY and dynamic_word:
                         return "`%s` before `%s`, a program that is not known" % (_clip(word), sub)
     return None
+
+
+# Programs that only store or print the text they are given. A heredoc for one of these is data.
+DATA_SINKS = {"cat", "tee", "git", "tea", "gh"}
+HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# What a pattern search accepts before its pattern: flags that take no value. Any other option is not judged.
+SEARCH_FLAGS_RE = re.compile(r"^-[inIwFEHhrRcsvxoqaPUz]+$|^--(?:ignore-case|line-number|fixed-strings|word-regexp|"
+                             r"recursive|no-filename|with-filename|count|hidden|no-ignore|color=never)$")
+# The only `git commit` options judged plain: git also accepts any unique prefix of a long option
+# (`--fil=NAME`), so an allowlist is the only safe shape. `-m` takes the next word as text.
+COMMIT_LONG_OPTIONS = {"--allow-empty", "--no-verify", "--amend", "--no-edit", "--quiet", "--signoff", "--all"}
+
+
+def _commit_is_plain(text, stdin_message=False):
+    """Whether the command text is `git commit ...` taking a message as text: no option that reads a file.
+
+    The words are read as the shell reads them (quotes and backslashes removed), so `"-F"` and `\\-F` are
+    the option they spell; text that does not parse is not plain. stdin_message: `-F -` is allowed, the
+    message comes from the heredoc that follows.
+    """
+    try:
+        words = shlex.split(text)
+    except ValueError:
+        return False
+    if len(words) < 2 or words[0].rsplit("/", 1)[-1] != "git" or words[1] != "commit":
+        return False  # an assignment in front, another subcommand (`cat-file --batch` reads names): not judged
+    rest = iter(words[2:])
+    for word in rest:
+        if "$" in word or "`" in word:
+            return False
+        if word == "-F" and stdin_message:
+            if next(rest, None) != "-":
+                return False
+        elif re.fullmatch(r"-[aqsnv]*m", word):
+            next(rest, None)  # the message
+        elif word.startswith("-m") and not word.startswith("--"):
+            continue  # `-mtext`
+        elif word.startswith("--"):
+            if word not in COMMIT_LONG_OPTIONS:
+                return False
+        elif word.startswith("-") and len(word) > 1:
+            if not re.fullmatch(r"-[aqsnv]+", word):
+                return False
+    return True
+
+
+def _strip_data_heredocs(command):
+    """The command without the bodies of heredocs that only hand text to a data sink.
+
+    `cat <<EOF > notes.md` stores a note that may mention a file; `bash <<EOF` runs its body. Only the
+    first kind is dropped: the receiver must be a known data sink, nothing may follow the heredoc on its
+    line but a plain redirect, and an unquoted body must hold no expansion. Anything else, or a body with
+    no closing line, is left in the text and judged like any other command.
+    """
+    if "<<" not in command:
+        return command
+    lines, out, index = command.split("\n"), [], 0
+    while index < len(lines):
+        line = lines[index]
+        out.append(line)
+        index += 1
+        match = HEREDOC_RE.search(line)
+        if not match or "<<<" in line:
+            continue
+        before = line[:match.start()]
+        # A `<<` inside quotes, after a backslash or a `#`, or a second one, is not the heredoc this reads it as.
+        if re.search(r"['\"\\#]", before) or line.count("<<") != 1:
+            continue
+        words = _words(before)
+        if not words or words[0].rsplit("/", 1)[-1] not in DATA_SINKS:
+            continue
+        if re.search(r"[|;&`$(){}<'\"\\#]", line[match.end():]):
+            continue  # all that may follow the tag is a plain redirect
+        if words[0].rsplit("/", 1)[-1] == "git" and not _commit_is_plain(before, stdin_message=True):
+            continue  # other git commands read names from stdin (`git cat-file --batch`)
+        if re.search(r"[|;&`$(){}]", before):
+            continue
+        end = next((i for i in range(index, len(lines)) if lines[i].strip() == match.group(2)), None)
+        if end is None:
+            continue
+        body = lines[index:end]
+        if not match.group(1) and any(re.search(r"[$`]", text) for text in body):
+            continue  # an unquoted heredoc expands $(...) in its body
+        out.append(lines[end])
+        index = end + 1
+    return "\n".join(out)
+
+
+def _only_mentions(segment, command):
+    """Whether the segment only names an env file in text it prints, stores or searches for.
+
+    That is `echo` and `printf` (when nothing pipes or reads their output), `git commit -m`, and a
+    `grep`/`rg` whose pattern is the name. None of them prints the file; a file argument still counts.
+    """
+    words = _words(segment)
+    if not words:
+        return False
+    program = words[0].rsplit("/", 1)[-1]
+    if re.search(r"[&(){}`]", segment):
+        # A single `&` starts another command in the same segment (`echo ok & cat NAME`), and the rest
+        # can nest one; a mention is judged only when the segment is a plain command.
+        return False
+    if program in ("echo", "printf"):
+        # The text can be fed to a program that opens the name: `echo NAME | xargs cat`.
+        # A redirect can write a script that a later command runs: `echo 'cat NAME' > s.sh && bash s.sh`.
+        return not re.search(r"[|`>]|<<<|\b(?:xargs|read|eval|source)\b", command)
+    if program == "git":
+        return _commit_is_plain(segment)
+    if program in ("grep", "rg"):
+        try:
+            words = shlex.split(segment)  # as the shell reads it: `'--pre=NAME'` is an option, not a pattern
+        except ValueError:
+            return False
+        if not words or words[0].rsplit("/", 1)[-1] not in ("grep", "rg"):
+            return False
+        pattern, positional = None, []
+        rest = iter(words[1:])
+        for word in rest:
+            if "$" in word or "`" in word:
+                return False  # shlex does not decode `$'--pre=NAME'`, and `$X` can be an option
+            if word == "--":
+                positional.extend(rest)
+                break
+            if word in ("-e", "--regexp"):
+                pattern = next(rest, "")
+            elif word.startswith("--regexp="):
+                pattern = word.partition("=")[2]
+            elif word.startswith("-") and len(word) > 1:
+                if not SEARCH_FLAGS_RE.match(word):
+                    return False
+            else:
+                positional.append(word)
+        if pattern is None and positional:
+            positional = positional[1:]  # the first word is the pattern
+        return not any(_env_names(w) for w in positional)
+    return False
 
 
 def _is_tv_run(segment):
@@ -698,6 +858,7 @@ def _reads_env_file(tool, tool_input, depth=0, cwd=None):
         command = tool_input.get("command", "")
         if not isinstance(command, str):
             return False
+        command = _strip_data_heredocs(command)
         segments = re.split(r"&&|\|\||[;|\n]", command)
         # A command that changes directory makes a relative path
         # unresolvable, so the file it names cannot be checked.
@@ -722,7 +883,8 @@ def _reads_env_file(tool, tool_input, depth=0, cwd=None):
                 # the rest: `cat .env.example .env` reads both files.
                 if all(SAFE_ENV_RE.fullmatch(name) for name in names):
                     continue
-                if part is segment and not _has_substitution(segment) and _is_metadata(part, depth, cwd):
+                if part is segment and not _has_substitution(segment) and (
+                        _is_metadata(part, depth, cwd) or _only_mentions(part, command)):
                     continue
                 return True
         return False
@@ -804,7 +966,8 @@ def pre_tool_use(event, secrets):
     matched = _runs_human_only(tool_input.get("command")) if tool == "Bash" else None
     if matched:
         return _deny("securikey: `skey sync` and `skey rotate` send secret values to a server, and the "
-                     "address can be set on the command line, so you run them in your own terminal, "
+                     "address can be set on the command line; `skey config` and `skey add --config` stop a "
+                     "stored value being redacted. So you run them in your own terminal, "
                      "not the agent. (Matched: %s. In written text, describe the command instead of "
                      "quoting it.)" % matched)
     if _reads_env_file(tool, tool_input, cwd=event.get("cwd")):
@@ -908,6 +1071,20 @@ def _replace_strings(value, notice):
     return notice if isinstance(value, str) else value
 
 
+def without_config(secrets, marks):
+    """The secrets minus the entries a person marked as non-secret configuration, whose value is then
+    neither redacted nor blocked. A mark holds only for the value it was made for (store.config_names)."""
+    marked = config_names(secrets, marks)
+    return {name: value for name, value in secrets.items() if name not in marked}
+
+
+def drop_config(store, secrets):
+    try:
+        return without_config(secrets, store.load_config())
+    except VaultError:
+        return secrets  # nothing is marked when the marks can't be read: the entries stay secret
+
+
 def handle(kind, event, store):
     """Run one hook. If the keychain can't be read, known-value checks are skipped (patterns still run)
     and the user is told; the hook itself never crashes.
@@ -919,7 +1096,7 @@ def handle(kind, event, store):
     load_error = None
     retired = {}
     try:
-        secrets = store.load()
+        secrets = drop_config(store, store.load())
         retired = store.load_watch()
         warning = store.warning  # set by a store that had a partial failure
     except VaultError as exc:

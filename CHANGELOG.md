@@ -1,5 +1,19 @@
 # Changelog
 
+## [3.2.0] - 2026-11-09
+
+### Added
+- An entry can be marked as non-secret configuration, so its value is neither redacted from output nor blocked in a command. A local server address that was stored as an entry used to deny every command containing it, even through `skey run`. `skey add --config <name>` stores a value that way; `skey config <name> on|off` marks or unmarks an entry that exists; `skey list` shows `(config)`. Both refuse to run outside your own terminal (stdin is a TTY, `SECURIKEY_HEADLESS` unset), as `sync` and `rotate` do, because a marked value is readable by the agent. As a second layer, the pre-hook denies a Bash call that names the literal commands `skey config` or `skey add --config` (also nested, quoted or behind a wrapper such as `script`); other uses of the word `config` pass.
+- The default is unchanged: every entry is a secret. The marks are a separate keychain item (`config`), so the secrets map keeps its format and an upgrade marks nothing. A mark records a hash of the value it was made for: storing a new value under the name (anything that overwrites it, including `skey add` with a piped value) makes the entry a secret again, and `skey rm` clears the mark. Values rotated out by `skey rotate`, fetched from Paperclip or listed in `SECURIKEY_WATCH_ENV` are never dropped by a mark. A mark item that cannot be read leaves every entry secret.
+
+## [3.1.4] - 2026-11-08
+
+Fewer false positives in the pre-hook: it denies reads, not mentions.
+
+### Changed
+- The human-only gate (`skey sync`, `skey rotate`) reads a word with only `*` or `?` globs as a program only if its literal characters can spell `skey` in order. A bold label such as `**Open:**` before `sync` or `rotate` is prose in a heredoc, a quoted argument or after a wrapper such as `make`. Words with `$`, a backtick, `~`, `[` or `/` are still unknown programs, and so are `s*y`, `sk?y` and `*key`.
+- The env-file guard no longer denies a command that only names a file in text: `echo` and `printf` (when nothing pipes, redirects, reads or evals their output), `git commit` (only with a known set of plain options and a message; `-F -` with a heredoc), `grep` and `rg` with the name as the pattern, and a heredoc whose receiver is `cat`, `tee`, `tea`, `gh` or `git commit`, with no quote, `#`, second heredoc, pipe or expansion before the tag or after it, and none in an unquoted body. A segment with a `&`, parenthesis, brace or backtick is not judged as a mention. A file argument, `-f`, `-g`, `--pre`, a shell heredoc, `cat`, redirection, `source` and `xargs` are still denied.
+
 ## [3.1.3] - 2026-11-03
 
 ### Changed

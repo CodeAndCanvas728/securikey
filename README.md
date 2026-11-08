@@ -86,6 +86,7 @@ Coming from token-vault? See [docs/migrating.md](docs/migrating.md).
 ```bash
 skey add github                                  # hidden prompt; never pass a value as an argument
 skey list
+skey add --config local_api                     # configuration, not a secret (a local server address): not redacted or blocked
 skey run --env GH_TOKEN=github -- gh api user
 skey import .env --dry-run && skey import .env     # the secrets it recognised become names
 skey run --dotenv .env -- npm run dev

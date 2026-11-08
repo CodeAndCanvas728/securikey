@@ -617,6 +617,36 @@ class HumanOnlyCommandsTest(unittest.TestCase):
             self.assertIsNone(self.verdict("cat <<'EOF'\n%s\nEOF" % line), line)
             self.assertIsNone(self.verdict('echo "%s"' % line), line)
 
+    def test_a_bold_label_before_sync_or_rotate_passes(self):
+        # `**Open:**` is a glob, but its literal characters cannot spell skey, so it is not a program.
+        for line in ("**Open:** sync the plan", "**Note:** rotate keys", "**Open:** sync", "**TODO** rotate"):
+            self.assertIsNone(self.verdict("cat <<'EOF'\n%s\nEOF" % line), line)
+            self.assertIsNone(self.verdict("make docs **Open:** sync"), line)
+            self.assertIsNone(self.verdict('git commit -m "%s"' % line), line)
+
+    def test_marking_an_entry_as_configuration_is_human_only_too(self):
+        for command in ("skey config server_url on", "skey add --config server_url", "./plugin/bin/skey config x off",
+                        "echo v | skey add --config x", "script -q /dev/null skey config x on",
+                        "skey run -- skey config x on", "SKEY config x on", "s''key add --config=1 x",
+                        "bash -c 'skey config x on'"):
+            out = self.verdict(command)
+            self.assertTrue(out and out["hookSpecificOutput"]["permissionDecision"] == "deny", command)
+            self.assertIn("your own terminal", out["hookSpecificOutput"]["permissionDecisionReason"])
+        for command in ("git config user.name x", "npm config get registry", "skey add github", "skey list",
+                        "$EDITOR config", "make config", "skey run --env A=b -- git config --list"):
+            self.assertIsNone(self.verdict(command), command)
+
+    def test_a_plain_path_before_sync_or_rotate_passes(self):
+        for command in ("./scripts/tool sync", "bin/vault rotate k", "/usr/local/bin/other sync"):
+            self.assertIsNone(self.verdict(command), command)
+
+    def test_a_glob_that_can_spell_skey_is_still_denied(self):
+        for command in ("\\s*y sync", '"s"*y sync', "'s'*y rotate k", "s\\*y sync", "'s*y' sync",
+                        "s*^y sync", "s*#y sync", "/usr/bin/s*y sync", "sk?y sync","*key sync", "s*y rotate k", "**s** sync", "s[k]ey sync", "*/skey sync",
+                        "~/bin/skey sync", "make **S*y** sync"):
+            out = self.verdict(command)
+            self.assertTrue(out and out["hookSpecificOutput"]["permissionDecision"] == "deny", command)
+
     def test_dynamic_program_in_command_position_is_denied(self):
         for command in ("$S sync", "s*y sync", "env $S sync", "sudo $S rotate k", 'bash -c "$S sync"',
                         "x && $S sync", "if $S sync; then :; fi", "xargs -0 $S sync", "timeout 5 $S sync",

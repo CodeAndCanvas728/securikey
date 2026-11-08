@@ -1,6 +1,8 @@
 """`skey`: keep secrets in the OS keychain and hand them only to the process that needs them.
 
   skey add <name>                     value from a hidden prompt or stdin, never from the command line
+  skey add --config <name>            store a value that is configuration, not a secret (your terminal only)
+  skey config <name> on|off           mark a stored entry as configuration, or back to secret (your terminal only)
   skey list | skey rm <name>
   skey run [--env VAR=name]... [--dotenv FILE]... [--env-from-paperclip VAR=key]... -- <command...>
   skey import <.env file> [--all] [--dry-run]   move values into the keychain, leave `securikey:<name>`
@@ -25,7 +27,8 @@ import tempfile
 from securikey import audit, doctor, hooks, migrate, paperclip, runfilter
 from securikey.dotenv import LEGACY_REF_PREFIX, REF_PREFIX, is_ref, parse_dotenv, parse_ref, secret_like
 from securikey.redact import MIN_SECRET_LEN, PATTERNS, known_forms
-from securikey.store import LEGACY_SERVICE, KeychainStore, VaultError, check_name, is_headless
+from securikey.store import (LEGACY_SERVICE, KeychainStore, VaultError, check_name, config_names, is_headless,
+                             value_mark)
 
 PAPERCLIP_VALUE_TTL = 24 * 3600  # seconds a value fetched from Paperclip stays in the redaction set
 DEFAULT_KEEP_DAYS = 7  # days a rotated-out value stays in the redaction set
@@ -41,17 +44,44 @@ def _read_value(name):
 
 def cmd_add(args, store):
     name = check_name(args.name)
+    if args.config:
+        require_terminal("add --config", CONFIG_WHY)
     value = _read_value(name)
     with store.transaction():
         secrets = store.load()
         secrets[name] = value
         store.save(secrets)
-    print("stored %s" % name)
+        if args.config:
+            store.save_config({**store.load_config(), name: value_mark(value)})
+    print("stored %s%s" % (name, " (non-secret configuration)" if args.config else ""))
+
+
+def cmd_config(args, store):
+    """Mark a stored entry as non-secret configuration, or back to secret."""
+    require_terminal("config", CONFIG_WHY)
+    name = check_name(args.name)
+    with store.transaction():
+        secrets = store.load()
+        if not isinstance(secrets.get(name), str):
+            raise VaultError("no secret named %s" % name)
+        marks = dict(store.load_config())
+        if args.state == "on":
+            marks[name] = value_mark(secrets[name])
+        else:
+            marks.pop(name, None)
+        store.save_config(marks)
+    print("%s is %s" % (name, "non-secret configuration: not redacted, not blocked" if args.state == "on"
+                        else "a secret"))
 
 
 def cmd_list(args, store):
-    names = sorted(store.load())
-    print("\n".join(names) if names else "(no secrets stored)")
+    secrets = store.load()
+    try:
+        marked = config_names(secrets, store.load_config())
+    except VaultError:
+        marked = set()
+    lines = ["%s%s" % (name, "  (config)" if name in marked else "") for name in sorted(secrets)]
+    print("\n".join(lines) if lines else "(no secrets stored)")
 
 
 def cmd_rm(args, store):
@@ -59,7 +89,7 @@ def cmd_rm(args, store):
         secrets = store.load()
         if secrets.pop(args.name, None) is None:
             raise VaultError("no secret named %s" % args.name)
-        store.save(secrets)
+        store.save(secrets)  # also drops the entry's mark
     print("removed %s" % args.name)
 
 
@@ -164,6 +194,8 @@ def _redaction_set(store, secrets, fetched=None):
     env_secrets, env_problems = hooks.watched_env_secrets()
     for problem in problems + env_problems:
         print("skey: %s" % problem, file=sys.stderr)
+    # What hooks.handle drops: an entry marked as configuration is not redacted from this output either.
+    secrets = hooks.drop_config(store, secrets)
     return {**dotenv_secrets, **env_secrets, **watched, **(fetched or {}), **secrets}
 
 
@@ -250,6 +282,9 @@ class _HookStore:
 
     def load_watch(self):
         return self.store.load_watch()
+
+    def load_config(self):
+        return self.store.load_config()
 
     def load(self):
         current = self.store.load()
@@ -347,14 +382,19 @@ def _at_terminal():
     return sys.stdin.isatty()
 
 
-def require_terminal(what):
-    """`sync` and `rotate` send values to a server whose address the environment sets, so they run only
-    for a person at a terminal: stdin is a TTY and this is not an unattended run (SECURIKEY_HEADLESS).
-    An agent's shell has no TTY. This is the control that does not depend on reading shell text; a
-    process that allocates a pseudo-terminal itself is outside what this can stop."""
+SEND_WHY = "sends secret values to a server"
+CONFIG_WHY = "makes a value readable by the agent (it is no longer redacted or blocked)"
+
+
+def require_terminal(what, why=SEND_WHY):
+    """`sync` and `rotate` send values to a server whose address the environment sets, and marking an entry
+    as configuration stops it being redacted, so they run only for a person at a terminal: stdin is a TTY
+    and this is not an unattended run (SECURIKEY_HEADLESS). An agent's shell has no TTY. This is the
+    control that does not depend on reading shell text; a process that allocates a pseudo-terminal itself
+    is outside what this can stop."""
     if is_headless() or not _at_terminal():
-        raise VaultError("`skey %s` sends secret values to a server, so it runs only from your own terminal "
-                         "(not from an agent, a script or an unattended run)" % what)
+        raise VaultError("`skey %s` %s, so it runs only from your own terminal "
+                         "(not from an agent, a script or an unattended run)" % (what, why))
 
 
 def cmd_sync(args, store):
@@ -448,8 +488,14 @@ def parser():
                                 formatter_class=argparse.RawDescriptionHelpFormatter,
                                 epilog="\n".join(lines[1:]).strip("\n"))
     sub = p.add_subparsers(dest="cmd", required=True, metavar="<command>")
-    sub.add_parser("add", help="store a secret (hidden prompt or stdin)", allow_abbrev=False).add_argument(
-        "name", help="lowercase letters, digits and _")
+    add = sub.add_parser("add", help="store a secret (hidden prompt or stdin)", allow_abbrev=False)
+    add.add_argument("name", help="lowercase letters, digits and _")
+    add.add_argument("--config", action="store_true",
+                     help="store it as non-secret configuration (not redacted or blocked); your terminal only")
+    cfg = sub.add_parser("config", help="mark a stored entry as non-secret configuration, or back (your terminal "
+                         "only)", allow_abbrev=False)
+    cfg.add_argument("name")
+    cfg.add_argument("state", choices=["on", "off"])
     sub.add_parser("list", help="list the stored names (never values)", allow_abbrev=False)
     sub.add_parser("rm", help="delete a secret", allow_abbrev=False).add_argument("name")
     run = sub.add_parser("run", help="run a command with secrets in its environment", allow_abbrev=False)
@@ -487,7 +533,7 @@ def parser():
     return p
 
 
-COMMANDS = {"add": cmd_add, "list": cmd_list, "rm": cmd_rm, "run": cmd_run, "import": cmd_import,
+COMMANDS = {"add": cmd_add, "config": cmd_config, "list": cmd_list, "rm": cmd_rm, "run": cmd_run, "import": cmd_import,
             "hook": cmd_hook, "warm": cmd_warm, "migrate": cmd_migrate, "sync": cmd_sync,
             "rotate": cmd_rotate, "doctor": cmd_doctor,
             "patterns": lambda a, s: print("\n".join(sorted(PATTERNS)))}

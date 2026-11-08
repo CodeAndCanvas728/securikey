@@ -4,6 +4,8 @@ All secrets live in one keychain item as a JSON map of name -> value, so the OS 
 and access control and this project ships no cryptography of its own.
 """
 import contextlib
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -41,6 +43,7 @@ SERVICE = current_service()  # kept for callers that import it; new code calls c
 LEGACY_SERVICE = os.environ.get("TOKEN_VAULT_SERVICE", "token-vault")
 ACCOUNT = "secrets"
 WATCH_ACCOUNT = "watch"  # values that are redacted for a while: retired by `skey rotate`, fetched from Paperclip
+CONFIG_ACCOUNT = "config"  # entries a person marked as non-secret configuration: {name: hash of the marked value}
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 LOCK_TIMEOUT = 10.0  # seconds to wait for another process to finish
 
@@ -156,6 +159,28 @@ class KeychainStore:
             except keyring.errors.KeyringError as exc:
                 raise VaultError("keychain unavailable: %s" % type(exc).__name__) from exc
 
+    def load_config(self):
+        """{name: hash} of the entries marked as non-secret configuration. A missing, corrupt or
+        unreadable item is empty: nothing is marked, so every entry stays secret."""
+        keyring = _keyring()
+        try:
+            return _parse_config(keyring.get_password(self.service, CONFIG_ACCOUNT))
+        except keyring.errors.KeyringError as exc:
+            raise VaultError("keychain unavailable: %s" % type(exc).__name__) from exc
+
+    def save_config(self, marks):
+        keyring = _keyring()
+        try:
+            if marks:
+                keyring.set_password(self.service, CONFIG_ACCOUNT, json.dumps(marks, sort_keys=True))
+            else:
+                try:
+                    keyring.delete_password(self.service, CONFIG_ACCOUNT)
+                except keyring.errors.PasswordDeleteError:
+                    pass
+        except keyring.errors.KeyringError as exc:
+            raise VaultError("keychain unavailable: %s" % type(exc).__name__) from exc
+
     def load(self):
         keyring = _keyring()
         try:
@@ -177,6 +202,12 @@ class KeychainStore:
     def save(self, secrets):
         keyring = _keyring()
         try:
+            # Every write path goes through here, so a mark never outlives the value it was made for:
+            # dropped first, so a failure after it leaves an entry secret, never marked.
+            marks = _parse_config(keyring.get_password(self.service, CONFIG_ACCOUNT))
+            kept = {name: mark for name, mark in marks.items() if name in config_names(secrets, marks)}
+            if kept != marks:
+                self.save_config(kept)
             keyring.set_password(self.service, ACCOUNT, json.dumps(secrets, sort_keys=True))
         except keyring.errors.KeyringError as exc:
             raise VaultError("keychain unavailable: %s" % type(exc).__name__) from exc
@@ -205,6 +236,13 @@ class MemoryStore:
         self.service = service
         self.secrets = dict(secrets or {})
         self.watch = {}  # label -> {"value", "until"}
+        self.config = {}  # name -> hash of the value that was marked as non-secret
+
+    def load_config(self):
+        return dict(self.config)
+
+    def save_config(self, marks):
+        self.config = dict(marks)
 
     def load_watch(self):
         return _live(self.watch, time.time())
@@ -216,6 +254,8 @@ class MemoryStore:
         return dict(self.secrets)
 
     def save(self, secrets):
+        marked = config_names(secrets, self.config)
+        self.config = {name: mark for name, mark in self.config.items() if name in marked}
         self.secrets = dict(secrets)
 
     def delete(self):
@@ -239,6 +279,32 @@ def _parse_watch(raw):
     return {k: v for k, v in data.items()
             if isinstance(k, str) and isinstance(v, dict) and isinstance(v.get("value"), str)
             and isinstance(v.get("until"), (int, float))}
+
+
+def _parse_config(raw):
+    """{name: hash} from the stored JSON; anything malformed is dropped, which leaves the entry secret."""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def value_mark(value):
+    """What a mark records about a value, so it holds only for that value."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def config_names(secrets, marks):
+    """The names whose mark still matches the stored value. A value stored again (anything that
+    overwrites it) no longer matches, so the entry is a secret again. save() also drops the stale mark,
+    so storing the old value a third time does not bring the mark back."""
+    return {name for name, mark in marks.items()
+            if isinstance(secrets.get(name), str) and hmac.compare_digest(mark, value_mark(secrets[name]))}
 
 
 def _live(items, now):
