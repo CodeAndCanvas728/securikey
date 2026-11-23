@@ -142,6 +142,24 @@ class RunTest(unittest.TestCase):
         self.assertEqual((env["DEPLOY"], env["PLAIN"], env["GH"]), (SECRET, "hello", "ghp_x"))
         self.assertNotIn("DEPLOY", os.environ)
 
+    def test_a_plain_value_in_a_dotenv_file_is_redacted_from_the_run_output(self):
+        plain = os.path.join(self.tmp.name, "plain.env")
+        with open(plain, "w") as fh:
+            fh.write("TOKEN=%s\nDEPLOY=securikey:deploy_key\n" % SECRET)
+        store = MemoryStore({"deploy_key": "another-Deploy-Value-77"})
+        seen = []
+        err = io.StringIO()
+        args = cli.parser().parse_args(["run", "--dotenv", plain, "--", "true"])
+        with mock.patch.object(cli, "_filter_output", return_value=True), \
+                mock.patch.object(cli.runfilter, "run", side_effect=lambda c, e, known: seen.append((e, known)) or 0), \
+                redirect_stderr(err):
+            cli.cmd_run(args, store)
+        env, known = seen[0]
+        self.assertEqual(env["TOKEN"], SECRET)
+        self.assertIn(SECRET, repr(known))
+        self.assertIn("holds plain values", err.getvalue())
+        self.assertNotIn(SECRET, err.getvalue())
+
     def test_the_deprecated_token_vault_prefix_still_resolves_with_a_notice_and_no_value(self):
         legacy = os.path.join(self.tmp.name, "legacy.env")
         with open(legacy, "w") as fh:

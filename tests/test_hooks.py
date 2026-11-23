@@ -111,7 +111,7 @@ class PreToolUseTest(unittest.TestCase):
                        "cat <<EOF > notes.md\nnote .env\n",  # a heredoc with no closing line is judged as written
                        # text written to a file can be run next
                        "echo 'cat .env' > s.sh && bash s.sh", "printf 'cat .env\\n' > s.sh; sh s.sh",
-                       "echo 'cat .env' >> run.sh",
+                       "echo 'cat .env' >> run.sh && bash run.sh", "cat > s.sh <<'EOF'\ncat .env\nEOF\nbash s.sh",
                        # a single & starts another command in the same segment
                        "echo ok & cat .env", "git commit -m x & cat .env", "echo x & cat .env.local",
                        "rg x src & cat .env", "echo ok & (cat .env)", "echo ok & { cat .env; }",
@@ -134,6 +134,134 @@ class PreToolUseTest(unittest.TestCase):
             self.assertIsNone(hooks.handle("pre", bash(cmd), STORE), cmd)
         for cmd in denied_cmds:
             self.assertTrue(denied(hooks.handle("pre", bash(cmd), STORE)), cmd)
+
+    def test_a_mention_is_allowed_in_one_simple_command_whatever_the_text_says(self):
+        # Issue #33: the name is only in text. The word "read" and ";" in the prose, a printf to a file, a
+        # heredoc to cat and a comment are not reads, as long as the call is one simple command.
+        allowed = ['echo "a note that mentions a .env read in prose"', 'echo "x; see .env"',
+                   'echo "a && b | c .env"', "echo 'xargs and eval and source .env'",
+                   "printf '%s\\n' \"a note that mentions a .env read in prose\" > note.md",
+                   "echo 'cat .env' >> run.sh", "echo 'see .env' 2>&1",
+                   "cat > \"$D/note.md\" <<'EOF'\nA line mentioning .env; and `x`\nEOF",
+                   "cat > notes/note.md <<'EOF'\nA line mentioning .env\nEOF",
+                   "git commit -F - <<'EOF'\nTitle\n\nnever read .env\nEOF",
+                   "cat <<EOF > n.md\nplain $HOME text about .env\nEOF",
+                   "echo ok # a comment about .env"]
+        for cmd in allowed:
+            self.assertIsNone(hooks.handle("pre", bash(cmd), STORE), cmd)
+
+    def test_a_mention_in_a_call_of_several_commands_is_denied_as_on_main(self):
+        # The systematic rule (review rounds 2 to 6): a name is a mention only in one simple command. Whatever
+        # else is in the call (a second command, a substitution, a nested shell) could open the file, and
+        # every attempt to prove it could not was bypassed, so the call is denied and the message says how to split it.
+        denied_cmds = [
+            # the rows that #33 asked for, now denied: split the call or use the Write tool
+            "mkdir -p \"$D\" && cat > \"$D/note.md\" <<'EOF'\nA line mentioning .env; and `x`\nEOF",
+            "mkdir -p notes && cat > notes/note.md <<'EOF'\nA line mentioning .env\nEOF",
+            "cd d && git commit -F - <<'EOF'\nTitle\n\nnever read .env\nEOF",
+            "cat <<EOF > n.md\nplain text about .env\nEOF\nls",
+            "mkdir -p d && echo 'see .env' > d/n.md && ls d", "echo 'see .env' > n.md; pwd",
+            "echo 'see .env' > n.md; wc -l other.md", "echo 'see .env'; echo done", "echo 'see .env' | cat",
+            "git commit -m 'about .env' && git push", "rg '.env' src; ls",
+            # a substitution next to the mention
+            "echo \"see .env $(date)\" > n.md", "echo 'see .env' > >(cat)", "echo \"see .env $(git rev-parse HEAD)\"",
+            "mkdir -p \"$(dirname d/other.md)\" && echo 'see .env' > d/n.md",
+            # a program the gate cannot name, an input redirect, two files written
+            "$X 'see .env'", "/bin/echo 'see .env'", "echo 'see .env' < in.txt", "echo 'see .env' > a.md > b.md",
+            "cat > n.md <<'EOF' < other.md\nsee .env\nEOF",
+            # round 2: an output process substitution runs a program next to the text
+            "echo 'cat .env' > >(bash)", "tee >(sh) <<'EOF'\ncat .env\nEOF",
+            # round 3 to 6: a nested shell, whatever it re-reads, is not a place a mention is allowed
+            "bash -c 'echo see .env'", "cd /x && bash -c 'echo see .env'",
+            "bash <<'EOF'\necho see .env\nEOF",
+            # round 6: write the script inside a nested shell, run it outside
+            "bash -c 'echo \"cat /tmp/.env\" > s.sh' && bash s.sh",
+            "bash <<'EOF'\necho 'cat /tmp/.env' > s.sh\nEOF\nbash s.sh",
+            "env bash -c 'echo \"cat /tmp/.env\" > s.sh' ; bash s.sh"]
+        for cmd in denied_cmds:
+            self.assertTrue(denied(hooks.handle("pre", bash(cmd), STORE)), cmd)
+        out = hooks.handle("pre", bash("mkdir -p d && echo 'see .env' > d/n.md"), STORE)
+        self.assertIn("in a call of several commands", out["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertIn("Write tool", out["hookSpecificOutput"]["permissionDecisionReason"])
+        out = hooks.handle("pre", bash("echo \"x $(date) .env\""), STORE)
+        self.assertIn("holds a substitution", out["hookSpecificOutput"]["permissionDecisionReason"])
+        out = hooks.handle("pre", bash("bash -c 'echo see .env'"), STORE)
+        self.assertIn("in a script run by a shell", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_a_mention_is_not_a_cover_for_a_read(self):
+        denied_cmds = ['echo hi; cat .env', 'echo "$(cat .env)"', 'echo "`cat .env`"', "cat < .env", "cat < .env.local",
+                       "wc -l < .env", "cat <<< .env", "echo x & cat .env", 'ec"ho" x;cat .env',
+                       "echo 'a; b' && cat .env", "echo \"x\" | cat .env", "echo .env | cat",
+                       "printf x > .env", "echo x >> .env", "echo x 2> .env",
+                       "echo 'unclosed .env", 'echo "unclosed .env', "echo ${X} .env", "echo $'x' .env",
+                       "if true; then echo .env; fi", "(echo .env)", "for f in .env; do cat $f; done",
+                       "cat <<EOF\n$(cat .env)\nEOF", "bash <<'EOF'\ncat .env\nEOF", "bash -c 'cat .env'",
+                       'bash -lc "echo ok; cat .env"', "bash -c 'echo ok' .env", "sudo cat .env",
+                       "python3 - <<'EOF'\nprint(open('.env').read())\nEOF", "node <<'EOF'\n// .env\nEOF",
+                       "tee x <<'EOF' | cat\n.env\nEOF", "cat <<'A' <<'B'\n.env\nA\nB",
+                       "echo 'cat .env' > s.sh\nsh s.sh", "echo 'cat .env' > s.sh; ./s.sh", "echo 'cat .env' > ./s.sh; sh s.sh",
+                       "printf 'cat .env' > $D/s.sh && bash $D/s.sh",
+                       # the written file is hidden from a literal match: a glob, a bracket, an expansion, a
+                       # variable, `~`, `exec`, a path to the script, an interpreter
+                       "echo 'cat .env' > s.sh; bash s*.sh", "echo 'cat .env' > s.sh; bash s[.]sh",
+                       "echo 'cat .env' > s.sh; bash $(echo s).sh", "echo 'cat .env' > s.sh; X=s.sh; bash $X",
+                       "exec >s.sh; echo 'cat .env'; bash s.sh", "echo 'cat .env' > s.sh; ./s*",
+                       "echo 'cat .env' > $HOME/s.sh; bash ~/s.sh", "echo 'cat .env' > s.sh; python3 s.sh",
+                       "cat > s.sh <<'EOF'\ncat .env\nEOF\nbash s?sh", "echo 'cat .env' > s.sh; . s*.sh",
+                       # the words of a `skey run` payload are quoted again, so `#` and `;` stay words
+                       "skey run -- cat '#' .env", "skey run -- cat ';' .env", "skey run -- cat '&&' .env",
+                       "$X .env", "e${Y}cho .env", "cat $(echo .env)", "cat <(echo .env)",
+                       "echo \"$(printf .env)\" | xargs cat"]
+        for cmd in denied_cmds:
+            self.assertTrue(denied(hooks.handle("pre", bash(cmd), STORE)), cmd)
+
+    def test_a_command_the_reader_cannot_finish_still_judges_the_name(self):
+        # Too many commands to compare, so the reader gives up; a name split by a line continuation is
+        # still seen, and nesting too deep to follow is denied whatever it names.
+        filler = "true;" * 600
+        self.assertTrue(denied(hooks.handle("pre", bash(filler + "cat .e\\\nnv"), STORE)))
+        self.assertTrue(denied(hooks.handle("pre", bash(filler + "cat .env"), STORE)))
+        self.assertIsNone(hooks.handle("pre", bash(filler + "echo ok"), STORE))
+        deep = 'echo ' + '$("' * 5000
+        self.assertTrue(denied(hooks.handle("pre", bash(deep), STORE)))
+
+    def test_text_written_to_a_file_is_denied_next_to_any_program_that_could_run_it(self):
+        for runner in ["fish s*.sh", "awk 'BEGIN{system(\"sh s*.sh\")}'", "git -c alias.x='!sh s*.sh' x",
+                       "make -f s*.sh", "find . -name 's*' -exec sh {} +", "perl s*.sh", "lua s*.sh", "tclsh s*.sh",
+                       "git frobnicate", "/bin/sh s*.sh", "./s*.sh", "$SHELL s*.sh",
+                       # an argument that names a program to run, or a hook that git runs
+                       "rg --pre sh . .", "sort --compress-program=sh x", "git commit -m x", "git switch x",
+                       "git branch x", "git push", "git status", "git diff --stat", "git add n.md", "git log"]:
+            cmd = "echo 'cat .env' > s.sh; " + runner
+            self.assertTrue(denied(hooks.handle("pre", bash(cmd), STORE)), cmd)
+        # a substitution runs a program in the same call: the written text is its input or the file it runs
+        for cmd in ["echo 'cat .env' > >(bash)", "cat > >(bash) <<'EOF'\ncat .env\nEOF",
+                    "tee >(sh) <<'EOF'\ncat .env\nEOF", "echo 'cat .env' > s.sh; ls $(bash s*.sh)",
+                    "echo 'cat .env' > s.sh; cat <(sh s*.sh)", "echo 'cat .env' > >(cat >(bash))",
+                    "echo 'cat .env' > \"$(echo s).sh\"; bash s.sh", "echo 'cat .env' > >(bash -c 'x' $(echo y))",
+                    # an unquoted heredoc expands a substitution in its body
+                    "echo 'cat .env' > s.sh; cat <<EOF\n$(bash s*.sh)\nEOF",
+                    "echo 'cat .env' > s.sh; cat <<EOF\n`sh s.sh`\nEOF",
+                    "cat > s.sh <<'A'\ncat .env\nA\ncat <<B\n$(bash s*.sh)\nB"]:
+            self.assertTrue(denied(hooks.handle("pre", bash(cmd), STORE)), cmd)
+
+    def test_the_denial_names_what_matched_and_never_a_value(self):
+        out = hooks.handle("pre", bash("echo hi; cat .env.local"), STORE)
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("`cat` is given `.env.local`", reason)
+        out = hooks.handle("pre", bash("python3 - <<'EOF'\nopen('.env')\nEOF"), STORE)
+        self.assertIn("fed to `python3`", out["hookSpecificOutput"]["permissionDecisionReason"])
+        out = hooks.handle("pre", bash("echo ${X} .env"), STORE)
+        self.assertIn("cannot read as shell", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_a_long_or_hostile_command_is_judged_quickly_and_fails_closed(self):
+        for body in ['"' * 60000, "$(" * 20000, "<<A " * 5000, "'" * 60000, "\\" * 60000, "a;" * 30000]:
+            start = time.monotonic()
+            hooks.handle("pre", bash("echo " + body + " .env"), STORE)
+            self.assertLess(time.monotonic() - start, 1.0, body[:6])
+        too_long = "echo " + "x" * 70000
+        self.assertIsNone(hooks.handle("pre", bash(too_long), STORE))
+        self.assertTrue(denied(hooks.handle("pre", bash(too_long + " .env"), STORE)))
 
     def test_a_shell_substitution_cannot_smuggle_a_read(self):
         # The allowlist covers the command that is written, not the one the
@@ -268,6 +396,164 @@ class PreToolUseTest(unittest.TestCase):
         # command may have moved somewhere else.
         cmd = "cd /srv && skey run --dotenv .env -- printenv"
         self.assertTrue(denied(hooks.handle("pre", bash_in(cmd, "/tmp"), STORE)), cmd)
+
+    def test_a_nested_shell_inherits_the_outer_directory_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".env"), "w") as fh:
+                fh.write("API_KEY=securikey:api_key\n")
+            run = "skey run --dotenv .env -- printenv"
+            # `source` and `.` are not a directory change: main allowed these lines, and a sourced script that
+            # changes directory is a known gap (docs/limits.md).
+            allowed = ["bash -c '%s'" % run, "skey run -- %s" % run,
+                       "source venv/bin/activate && %s" % run, ". venv/bin/activate && %s" % run]
+            refused = ["cd /srv && bash -c '%s'" % run,
+                       "builtin cd /srv && %s" % run, "command cd /srv && %s" % run,
+                       "command -p cd /srv && %s" % run, "builtin cd /srv && bash -c '%s'" % run,
+                       "eval cd /srv && %s" % run, "eval 'cd /srv' && %s" % run,
+                       "eval \"cd /srv && true\" && %s" % run, "X=cd; $X /srv && %s" % run,
+                       "time cd /srv && %s" % run, "time -p cd /srv && %s" % run, "! cd /srv; %s" % run,
+                       "popd && %s" % run,
+                       "eval 'c\"d\" /srv' && %s" % run, "eval \"c'd' /srv\" && %s" % run,
+                       "eval 'cd\"\" /srv' && %s" % run, "eval $X /srv && %s" % run, "eval {cd,/srv} && %s" % run,
+                       "eval cd$IFS/srv && %s" % run, "eval \"$(echo cd)\" /srv && %s" % run,
+                       "builtin $X /srv && %s" % run, "$(echo cd) /srv && %s" % run,
+                       "cd /srv\nbash <<'EOF'\n%s\nEOF" % run,
+                       "cd /srv && bash -c \"sh -c '%s'\"" % run,
+                       "cd /srv && skey run -- %s" % run, "cd /srv && skey run -- bash -c '%s'" % run]
+            for cmd in allowed:
+                self.assertIsNone(hooks.handle("pre", bash_in(cmd, tmp), STORE), cmd)
+            for cmd in refused:
+                self.assertTrue(denied(hooks.handle("pre", bash_in(cmd, tmp), STORE)), cmd)
+
+    def test_every_skey_run_in_a_command_is_checked_whatever_wraps_or_nests_it(self):
+        # Review round 5: neither file name below is a guarded name, so only the --dotenv check can stop them.
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "secrets"), "w") as fh:
+                fh.write("API_KEY=plainvalue123\n")
+            with open(os.path.join(tmp, "imported"), "w") as fh:
+                fh.write("API_KEY=securikey:api_key\n")
+            bad, good = "skey run --dotenv secrets -- printenv", "skey run --dotenv imported -- printenv"
+            deep = "skey run -- skey run -- skey run -- skey run -- "
+            refused = ["skey run -- " + bad, "skey run -- skey run --dotenv=secrets -- printenv",
+                       "cd /srv && skey run -- " + good, "skey run -- bash -c '%s'" % bad,
+                       "env " + bad, "command " + bad, "sudo " + bad, "nice " + bad, "timeout 5 " + bad,
+                       "skey run -- env " + bad, deep + good, deep + bad]
+            # thousands of runs must be refused fast, not judged one payload at a time (cubic work)
+            started = time.time()
+            self.assertTrue(denied(hooks.handle("pre", bash_in("skey run -- " * 3000 + "ls", tmp), STORE)))
+            self.assertLess(time.time() - started, 2)
+            refused += ["env skey run -- bash -c '%s'" % bad, deep + "skey run --do''tenv secrets -- printenv"]
+            allowed = ["skey run -- " + good, "env " + good, "echo skey run --dotenv secrets",
+                       "skey run -- skey run -- skey run -- skey run -- ls"]
+            for cmd in refused:
+                self.assertTrue(denied(hooks.handle("pre", bash_in(cmd, tmp), STORE)), cmd)
+            for cmd in allowed:
+                self.assertIsNone(hooks.handle("pre", bash_in(cmd, tmp), STORE), cmd)
+
+    def test_every_skey_run_main_denied_is_still_denied(self):
+        # The floor for the dotenv guard: the `skey run --dotenv FILE` check main made on the command text. Each row
+        # below was denied by origin/main's hooks.py when this was written (run against it, not assumed), so the
+        # parser-based reading may deny more but never less. The layer is built on this floor and must not replace it:
+        # a row that stops being denied here is a regression against the previous release.
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "secrets"), "w") as fh:
+                fh.write("API_KEY=plainvalue123\n")
+            with open(os.path.join(tmp, "imported"), "w") as fh:
+                fh.write("API_KEY=securikey:api_key\n")
+            bad, good = "skey run --dotenv secrets -- printenv", "skey run --dotenv imported -- printenv"
+            denied_by_main = [
+            "bash <<'EOF'\nSECURIKEY_RUN_FILTER=0 BAD\nEOF",
+            "sh <<EOF\nBAD\nEOF",
+            "cd /srv && bash <<'EOF'\nGOOD\nEOF",
+            "env bash <<'EOF'\nSECURIKEY_RUN_FILTER=0 BAD\nEOF",
+            "sudo sh <<'EOF'\nBAD\nEOF",
+            "bash -c 'sh' <<'EOF'\nBAD\nEOF",
+            "python3 <<'EOF'\nBAD\nEOF",
+            "cat <<'EOF' | bash\nBAD\nEOF",
+            "git -c alias.r='!sh' r <<'EOF'\nBAD\nEOF",
+            "bash -c 'true; BAD'",
+            "wc $(true; BAD)",
+            "true; BAD",
+            "true && BAD",
+            "cd /tmp && BAD",
+            "cd /srv; skey run --dotenv secrets -- printenv",
+            "bash -c 'cd /srv && BAD'",
+            "bash -c 'echo \"cat /tmp/.env\" > s.sh' && bash s.sh",
+            "skey run -- cat .env",
+            "skey run -- skey run --dotenv secrets -- ls .env",
+            "skey run --dotenv=secrets -- printenv",
+            ]
+            allowed_by_main = [
+            "GOOD",
+            "env GOOD",
+            "echo BAD",
+            "printf '%s' 'BAD'",
+            "bash <<'EOF'\nls\nEOF",
+            "echo $(date)",
+            ]
+            for row in denied_by_main:
+                cmd = row.replace("BAD", bad).replace("GOOD", good).replace("\\n", "\n")
+                self.assertTrue(denied(hooks.handle("pre", bash_in(cmd, tmp), STORE)), cmd)
+            for row in allowed_by_main:
+                cmd = row.replace("BAD", bad).replace("GOOD", good).replace("\\n", "\n")
+                self.assertIsNone(hooks.handle("pre", bash_in(cmd, tmp), STORE), cmd)
+
+    def test_many_unclosed_heredocs_are_judged_in_linear_time(self):
+        # origin/main's heredoc strip searched to the end for every unclosed tag: 200 KB took about 14 s of the 15 s limit.
+        started = time.time()
+        hooks.handle("pre", bash_in("cat <<EOF\n" * 20000, tempfile.gettempdir()), STORE)
+        self.assertLess(time.time() - started, 2)
+        # A different tag on every line defeats a memo of tags already searched for; the call is still judged.
+        started = time.time()
+        many = "".join("cat <<T%d\n" % number for number in range(20000)) + "cat .env\n"
+        self.assertTrue(denied(hooks.handle("pre", bash_in(many, tempfile.gettempdir()), STORE)))
+        self.assertLess(time.time() - started, 2)
+
+    def test_a_dotenv_file_is_read_once_per_call_and_at_most_a_fixed_total(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # 200 flags at a 1 MiB file of references took 10 s on main and 20 s with the parser (limit: 15 s).
+            with open(os.path.join(tmp, "big"), "w") as fh:
+                for number in range(30000):
+                    fh.write("API_KEY_%06d=securikey:api_key\n" % number)
+            started = time.time()
+            out = hooks.handle("pre", bash_in("skey run " + "--dotenv big " * 200 + "-- ls", tmp), STORE)
+            self.assertIsNone(out)
+            self.assertLess(time.time() - started, 5)
+            # The total read per call is capped: the second distinct file is past it and is not imported.
+            for name in ("a", "b"):
+                with open(os.path.join(tmp, name), "w") as fh:
+                    fh.write("API_KEY=securikey:api_key\n" * 4)
+            with mock.patch.object(hooks, "DOTENV_MAX_TOTAL_BYTES", 150):
+                self.assertIsNone(hooks.handle("pre", bash_in("skey run --dotenv a --dotenv a -- ls", tmp), STORE))
+                self.assertTrue(denied(hooks.handle("pre", bash_in("skey run --dotenv a --dotenv b -- ls", tmp), STORE)))
+
+    def test_a_skey_run_in_a_shell_heredoc_or_a_substitution_is_checked_without_a_name(self):
+        # Review round 7: neither body below spells a dotenv name, so only the --dotenv check can stop them.
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "secrets"), "w") as fh:
+                fh.write("API_KEY=plainvalue123\n")
+            with open(os.path.join(tmp, "imported"), "w") as fh:
+                fh.write("API_KEY=securikey:api_key\n")
+            bad, good = "skey run --dotenv secrets -- printenv", "skey run --dotenv imported -- printenv"
+            refused = ["bash <<'EOF'\nSECURIKEY_RUN_FILTER=0 %s\nEOF" % bad, "sh <<EOF\n%s\nEOF" % bad,
+                       "wc $(%s)" % bad, "echo `%s`" % bad, "cd /srv && bash <<'EOF'\n%s\nEOF" % good]
+            refused += ["env bash <<'EOF'\nSECURIKEY_RUN_FILTER=0 %s\nEOF" % bad, "sudo sh <<'EOF'\n%s\nEOF" % bad,
+                        "bash -c 'sh' <<'EOF'\n%s\nEOF" % bad, "python3 <<'EOF'\n%s\nEOF" % bad]
+            refused += ["cat <<EOF\n$(%s)\nEOF" % bad, "cat <<EOF\n$(cat .env)\nEOF",
+                        "git -c alias.r='!sh' r <<'EOF'\n%s\nEOF" % bad, "./cat <<'EOF'\n%s\nEOF" % bad]
+            allowed = ["cat <<EOF\n$(date)\nEOF", "cat <<EOF\nhello $USER\nEOF", "env bash <<'EOF'\nls\nEOF", "cat <<'EOF'\n%s\nEOF" % bad, "bash <<'EOF'\nls\nEOF", "bash <<'EOF'\n%s\nEOF" % good, "wc $(%s)" % good, "echo $(date)"]
+            for cmd in refused:
+                self.assertTrue(denied(hooks.handle("pre", bash_in(cmd, tmp), STORE)), cmd)
+            for cmd in allowed:
+                self.assertIsNone(hooks.handle("pre", bash_in(cmd, tmp), STORE), cmd)
+
+    def test_nested_payloads_share_one_parse_budget(self):
+        # A payload is re-judged at each level, so the work is bounded by one budget, not by count and depth alone.
+        big = "x" * 60000
+        cmd = "skey run -- " * 8 + big
+        started = time.time()
+        self.assertTrue(denied(hooks.handle("pre", bash_in(cmd, tempfile.gettempdir()), STORE)))
+        self.assertLess(time.time() - started, 1)
 
     def test_a_hook_that_fails_denies_rather_than_allowing(self):
         with mock.patch.object(hooks, "known_forms", side_effect=RuntimeError("boom")):

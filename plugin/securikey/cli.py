@@ -124,8 +124,12 @@ def cmd_rm(args, store):
     print("removed %s" % args.name)
 
 
-def read_dotenv(path, secrets):
-    """{VAR: value} from a dotenv file, with `securikey:<name>` references resolved."""
+def read_dotenv(path, secrets, plain=None):
+    """{VAR: value} from a dotenv file, with `securikey:<name>` references resolved.
+
+    A value that is not a reference and looks like a secret is added to `plain` (when given) as
+    {"dotenv-run:KEY": value}, so the caller can redact it from the output of the command it feeds.
+    """
     with open(path) as fh:
         text = fh.read()
     records, error = parse_dotenv(text)
@@ -140,6 +144,12 @@ def read_dotenv(path, secrets):
             name, is_legacy = ref
             legacy = legacy or is_legacy
             value = _lookup(name, secrets, path)
+        elif plain is not None:
+            for part in hooks._secret_parts(key, value):
+                label, n = "dotenv-run:" + key, 2
+                while label in plain and plain[label] != part:
+                    label, n = "dotenv-run:%s#%d" % (key, n), n + 1
+                plain[label] = part
         env[key] = value
     if legacy:
         print("skey: %s uses the deprecated `%s` prefix; write `%s` instead (the old one still works for now)"
@@ -160,8 +170,14 @@ def cmd_run(args, store, exec_fn=os.execvpe):
     secrets = store.load()
     env = dict(os.environ)
     names, variables = set(), set()
+    plain = {}  # secret-looking values read straight from a --dotenv file: redacted from this run's output
     for path in args.dotenv:
-        loaded = read_dotenv(path, secrets)
+        before = len(plain)
+        loaded = read_dotenv(path, secrets, plain)
+        if len(plain) > before:
+            print("skey: %s holds plain values; the ones that look like secrets are redacted from this command's "
+                  "output (short or plain-looking ones are not), and `skey import` would move them into the "
+                  "keychain" % path, file=sys.stderr)
         env.update(loaded)
         variables.update(loaded)
     for pair in args.env:
@@ -192,7 +208,7 @@ def cmd_run(args, store, exec_fn=os.execvpe):
         variables.add(var)
     audit.record(store.service, "run", names, variables, command)
     if exec_fn is os.execvpe and _filter_output():
-        return runfilter.run(command, env, known_forms(_redaction_set(store, secrets, fetched)))
+        return runfilter.run(command, env, known_forms(_redaction_set(store, secrets, fetched, plain)))
     exec_fn(command[0], command, env)
 
 
@@ -207,10 +223,10 @@ def _filter_output():
         return True
 
 
-def _redaction_set(store, secrets, fetched=None):
+def _redaction_set(store, secrets, fetched=None, plain=None):
     """Everything the hooks would redact that this process can name: the stored secrets, the watched
     values (a rotated-out value) and the values this run fetched from Paperclip, which are held in memory
-    so an unreadable watch list cannot drop them."""
+    so an unreadable watch list cannot drop them, and the plain values a `--dotenv` file put in the environment."""
     try:
         watched = store.load_watch()
     except VaultError as exc:
@@ -227,7 +243,7 @@ def _redaction_set(store, secrets, fetched=None):
         print("skey: %s" % problem, file=sys.stderr)
     # What hooks.handle drops: an entry marked as configuration is not redacted from this output either.
     secrets = hooks.drop_config(store, secrets)
-    return {**dotenv_secrets, **env_secrets, **watched, **(fetched or {}), **secrets}
+    return {**dotenv_secrets, **env_secrets, **watched, **(fetched or {}), **(plain or {}), **secrets}
 
 
 def _free_name(key, value, secrets):

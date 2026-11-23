@@ -1,5 +1,46 @@
 # Changelog
 
+## [3.7.0] - 2026-11-23
+
+The hook also reads a `skey run --dotenv FILE` that hides behind a wrapper, a nested run, a shell heredoc or a substitution. This is the best-effort layer that was split out of the 3.6.0 change, where review rounds 3 to 9 each found one more spelling. It adds to the check 3.6.0 keeps (main's text check), and never replaces it.
+
+### Added
+- Every `skey run` in a command has its `--dotenv` files checked and its payload judged, not only one at the start: behind `env`, `command`, `sudo`, `nice` or `timeout`, nested (`skey run -- skey run --dotenv secrets -- printenv`), and inside `bash -c '...'`. Past the nesting limit a command that holds `--dotenv` is denied, ignoring quotes and backslashes (`--do''tenv`). A command with more than 8 `skey run` words is denied, because each run's payload is re-judged and the work grew with the cube of the count.
+- A nested `bash -c '...'` or shell heredoc inherits the outer command's directory change (`cd /x && bash -c 'skey run --dotenv .env -- printenv'`), and `builtin cd`, `command cd`, `eval cd`, `popd` and a `cd` behind `time` or `!` count as one. `source` and `.` do not (a sourced script that changes directory is a known gap): counting them refused `source venv/bin/activate && skey run --dotenv F -- cmd`, which main allows.
+- A heredoc fed to anything that is not a known data sink (`cat`, `tee`, `git`, `tea`, `gh`) or printer is judged as a script, shells and wrappers included (`env bash <<'EOF'`, `sudo sh <<'EOF'`, an interpreter). So is an unquoted heredoc whose body holds a substitution, whatever the receiver (the shell expands it first), `git` unless it is a plain commit reading its message, and a sink spelled with a path (`./cat`).
+- A `$(...)` or backtick body is judged for a `skey run --dotenv FILE` even when its text names no dotenv file.
+- One call may parse at most 256 KB in all, nested payloads included (`MAX_PARSE_BUDGET`), and is denied past that.
+- A dotenv file named by `skey run --dotenv` is read once per call, and at most 4 MiB of them in all (a file past that counts as not imported). Without this, a command that named one 1 MiB file 200 times took 10 s on main and 20 s with the layer, past the hook's 15 s limit; it now takes under a second.
+
+### Gotchas
+- **A best-effort layer, not a guarantee.** Known gaps, not to be closed one spelling at a time (main has each of them too): `cat <<'EOF' | bash` and `echo '...' | sh` (the pipe is not followed from a printer or data sink), a script written in one call and run in another, a `-c` script behind a wrapper (`env bash -c ...`) or after another option (`bash -o pipefail -c ...`, which is only scanned for dotenv names), a program the reader cannot name (`S=skey; $S run ...`), a flag built by an expansion (`$'--\x64otenv'`), a program in another case (`SKEY run`, which runs on a case-insensitive file system), a sourced script that changes directory, and a wrapper option that changes directory (`env -C /srv skey run --dotenv F`, where `F` is read from the session folder). The control that does not depend on spelling is the run's own output filter.
+- **What a review finding is worth.** A regression against the previous release, a false positive on an ordinary command, or a crash or timeout is fixed. A new bypass spelling goes on the list above.
+- Main's text check runs first and is untouched. `test_every_skey_run_main_denied_is_still_denied` lists commands the previous release denied, and the layer must keep denying them.
+
+## [3.6.0] - 2026-11-23
+
+The dotenv name guard reads a Bash command as shell instead of cutting its text with regexes (issue #33), and a name is a mention only in one simple command.
+
+### Fixed
+- A command that only names a dotenv file in text is no longer denied when the text holds a `;`, `&&`, `|` or the word "read"/"source"/"eval"/"xargs" (`echo "see NAME; read it"`), or when `printf`/`echo` or a heredoc to `cat` writes it to a file. #26, 3.1.4 and 3.2.0 each added one more allowed shape and the next shape still failed; this was reproduced on 3.3.0, so it was not a stale plugin load.
+- The denial now says what matched (``` `cat` is given `.env` ```, `a heredoc naming .env is fed to python3`, `cannot read as shell`), so it no longer reads as if a file read was attempted.
+
+### Changed
+- New `plugin/securikey/shellparse.py`: one quote-aware reader (stdlib, a single pass, no backtracking) that returns commands with their words as the shell reads them, redirects, heredocs and substitution bodies. `hooks._bash_env_read` judges those instead of `re.split` on the raw text.
+- **A mention is allowed only in one simple command.** The call must be exactly one command (no `&&`, `;`, `|`, `||`), with no substitution, a program the gate can name (not an expansion or a path), no input redirect and at most one file written. The command is `echo`/`printf`, a plain `git commit`, a `grep`/`rg` whose pattern is the name, or a single heredoc to `cat`/`tee`/`tea`/`gh`/`git commit -F -`. A call of several commands that names a file is denied, as on main, and the message says to split the call or write the note with the Write tool. A name inside a `bash -c` script or a heredoc to a shell is never a mention. Why: review rounds 2 to 6 each found a way to make text in one command of a chained call open the file through another (a process substitution as the write target, a nested shell, write-then-run inside `bash -c`), and every fix grew the machinery that tried to prove a chained call safe. The rule has no such proof to get wrong. The removed code: `INERT`, `_runs_files`, `_body_runs_files`, `_subs_run_files`, `_target_in_use`, `_normal_path`.
+- Commands that only report names and hashes (`ls`, `test`, `git status`, `skey import|add|list...`) are allowed in any call, as before.
+- **The `skey run --dotenv FILE` check is main's, unchanged, and runs next to the parser.** The text is cut at `&&`, `||`, `;`, `|` and newlines (quotes ignored), data-sink heredocs removed, and a piece that starts with `skey run` has its files read, so a `skey run` after a separator is still found inside `bash -c '...'` or `$(...)`, in a heredoc fed to anything that is not a data sink, and in a pipe (`cat <<'EOF' | bash`). The parser may deny more, never less: `test_every_skey_run_main_denied_is_still_denied` lists commands that origin/main's `hooks.py` denied when it was written. A `skey run` behind a wrapper (`env`, `sudo`), nested (`skey run -- skey run --dotenv F`) or spelled by an expansion is not found, exactly as on main; the run filter below covers it. Reading those spellings is a separate change, because review rounds 3 to 9 each found one more and none of them was a regression of this fix.
+- `skey run` redacts the secret-looking plain values it loads from a `--dotenv` file from its own output (any path, not only the session's dotenv files), and prints a notice naming the file and saying that short or plain-looking values are not redacted. It does not depend on how the command is spelled, so it is the control; the hook's check is a floor.
+- The heredoc strip main already had no longer searches to the end of the text for every unclosed tag: 200 KB of `cat <<EOF` lines took about 14 s of the hook's 15 s limit on main and now takes under half a second, also with a different tag on every line (closing lines are found by bisection, not by a scan) (found by an automated security review of 0c9a9f2; behaviour otherwise unchanged).
+- `skey run -- cmd ...` is judged on its words quoted again, so a quoted `#` or `;` next to a name is not read as a comment or separator.
+- A heredoc fed to an interpreter that names a dotenv file is denied by design and now says so. All in `docs/limits.md`.
+
+### Gotchas
+- A note that spells a separator and then `skey run --dotenv <plaintext file>` is denied, as on main, because the check cuts the text at every separator, quotes ignored.
+- A call of several commands that names a dotenv file is denied even when each command is harmless (`mkdir -p d && cat > d/note.md <<'EOF' ... NAME ... EOF`). Split it into two calls, or write the note with the Write tool. This was the one row of #33 that the first version of this change allowed.
+- Text the reader does not model (`${...}`, `$'...'`, subshells, loops, an unclosed quote, over 64 KB) is not allowed through: it falls back to denying whenever a dotenv name is present. The name check stays best-effort: the output redaction is the guarantee.
+- `_runs_human_only` (`skey sync`/`rotate`) is untouched: it stays exemption-free and best-effort on purpose.
+
 ## [3.5.0] - 2026-11-23
 
 ### Added

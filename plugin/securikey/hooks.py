@@ -6,6 +6,7 @@
 - UserPromptSubmit: block prompts that contain a secret.
 Messages name what was found (secret names, token kinds); they never contain a value.
 """
+import bisect
 import heapq
 import os
 import re
@@ -14,7 +15,7 @@ import stat
 import sys
 from pathlib import Path
 
-from securikey import dotenv
+from securikey import dotenv, shellparse
 from securikey.redact import MIN_SECRET_LEN, find, known_forms, redact_obj
 from securikey.store import VaultError, config_names, is_headless
 
@@ -59,6 +60,8 @@ TV_RUN_OPTIONS = {"--env": 1, "--dotenv": 1, "--env-from-paperclip": 1}
 # A command that changes the directory, so a relative path is not resolvable.
 CHANGES_DIRECTORY = {"cd", "pushd"}
 MAX_NESTED = 3  # how deep `skey run -- skey run -- ...` is followed
+MAX_PARSE_BUDGET = 4 * shellparse.MAX_PARSE_CHARS  # characters parsed in one call, nested payloads included
+MAX_RUNS = 8  # `skey run` words judged in one command; each payload is re-judged, so more would cost n^MAX_NESTED
 MAX_DOTENV_BYTES = 1 << 20  # a dotenv file bigger than this is not read
 # A shell substitution runs another command.
 SUBSTITUTION_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`|<\(([^()]*)\)")
@@ -490,11 +493,6 @@ def _substitutions(segment, depth=0):
     return out
 
 
-def _has_substitution(segment):
-    """Whether the segment expands something at runtime."""
-    return any(token in segment for token in ("$(", "`", "${", "<(", ">("))
-
-
 def _tv_run_command(words):
     """(command, dotenv files) for a `skey run`, from the words after `skey run`.
 
@@ -528,7 +526,26 @@ def _tv_run_command(words):
     return command, dotenvs
 
 
+# What one hook call has read of dotenv files for `skey run --dotenv`, reset by _reads_env_file. A command that names
+# one file many times (the text check and the parser both judge it) or many files would otherwise read and parse each
+# one again for every flag: 200 flags at a 1 MiB file took 10 s on main and 20 s with the parser, past the 15 s limit.
+_DOTENV_CALL = {"checked": {}, "bytes": 0}
+
+
 def _dotenv_is_imported(path, cwd, uncertain_cwd=False):
+    """Whether every value in the file is empty or a securikey: reference.
+
+    A file is read once per hook call, and at most DOTENV_MAX_TOTAL_BYTES in all; past that
+    a file is not imported, so the call is denied.
+    """
+    key = (str(path), cwd, uncertain_cwd)
+    checked = _DOTENV_CALL["checked"]
+    if key not in checked:
+        checked[key] = _dotenv_file_is_imported(path, cwd, uncertain_cwd)
+    return checked[key]
+
+
+def _dotenv_file_is_imported(path, cwd, uncertain_cwd):
     """Whether every value in the file is empty or a securikey: reference.
 
     A file that still holds a plaintext value would put it into the child's
@@ -549,9 +566,11 @@ def _dotenv_is_imported(path, cwd, uncertain_cwd=False):
         # Only a regular file is read, and it is judged on the open descriptor: a stat
         # followed by an open can be raced (a FIFO swapped in between), and reading that
         # would block the hook until its timeout.
-        data, problem = _read_regular(target, MAX_DOTENV_BYTES)
-        if problem or len(data) > MAX_DOTENV_BYTES:
+        limit = min(MAX_DOTENV_BYTES, DOTENV_MAX_TOTAL_BYTES - _DOTENV_CALL["bytes"])
+        data, problem = _read_regular(target, limit)
+        if problem or len(data) > limit:
             return False
+        _DOTENV_CALL["bytes"] += len(data)
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return False
@@ -566,17 +585,13 @@ def _dotenv_is_imported(path, cwd, uncertain_cwd=False):
     return True
 
 
-def _is_metadata(segment, depth=0, cwd=None, uncertain_cwd=False):
-    """Whether the command only touches metadata, never the contents of a file.
+def _metadata_words(words, depth=0, cwd=None, uncertain_cwd=False, budget=None):
+    """Whether the command (its words, quotes removed) only touches metadata, never the contents of a file.
 
     `git show HEAD:.env` prints the file, so git is allowed only for the
     subcommands that report names and hashes. `skey run` executes a command, so
     that command is checked as one.
     """
-    words = _words(segment)
-    if not words:
-        # Nothing to run. A name that was seen is still a name.
-        return not _env_names(segment)
     command = words[0].rsplit("/", 1)[-1]
     if command == "git":
         sub = words[1].rsplit("/", 1)[-1] if len(words) > 1 else ""
@@ -588,7 +603,9 @@ def _is_metadata(segment, depth=0, cwd=None, uncertain_cwd=False):
         if sub == "run":
             inner, dotenvs = _tv_run_command(words[2:])
             if depth < MAX_NESTED:
-                return not _reads_env_file("Bash", {"command": " ".join(inner)}, depth + 1, cwd)
+                # Quoted again: the words have their quotes removed, and a bare `#` or `;` would read as a
+                # comment or a separator and hide the name that follows it.
+                return not _bash_env_read(shlex.join(inner), depth + 1, cwd, uncertain_cwd, budget=budget)
         return False
     if command == "ls":
         # `ls --from-file=.env` prints the names in the file.
@@ -707,6 +724,8 @@ def _runs_human_only(command):
 # Programs that only store or print the text they are given. A heredoc for one of these is data.
 DATA_SINKS = {"cat", "tee", "git", "tea", "gh"}
 HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+TEXT_PRINTERS = {"echo", "printf"}
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 # What a pattern search accepts before its pattern: flags that take no value. Any other option is not judged.
 SEARCH_FLAGS_RE = re.compile(r"^-[inIwFEHhrRcsvxoqaPUz]+$|^--(?:ignore-case|line-number|fixed-strings|word-regexp|"
                              r"recursive|no-filename|with-filename|count|hidden|no-ignore|color=never)$")
@@ -715,19 +734,14 @@ SEARCH_FLAGS_RE = re.compile(r"^-[inIwFEHhrRcsvxoqaPUz]+$|^--(?:ignore-case|line
 COMMIT_LONG_OPTIONS = {"--allow-empty", "--no-verify", "--amend", "--no-edit", "--quiet", "--signoff", "--all"}
 
 
-def _commit_is_plain(text, stdin_message=False):
-    """Whether the command text is `git commit ...` taking a message as text: no option that reads a file.
+def _commit_words_plain(words, stdin_message=False):
+    """Whether the words are `git commit ...` taking a message as text: no option that reads a file.
 
-    The words are read as the shell reads them (quotes and backslashes removed), so `"-F"` and `\\-F` are
-    the option they spell; text that does not parse is not plain. stdin_message: `-F -` is allowed, the
-    message comes from the heredoc that follows.
+    The words are as the shell reads them (quotes and backslashes removed), so `"-F"` and `\\-F` are
+    the option they spell. stdin_message: `-F -` is allowed, the message comes from the heredoc that follows.
     """
-    try:
-        words = shlex.split(text)
-    except ValueError:
-        return False
     if len(words) < 2 or words[0].rsplit("/", 1)[-1] != "git" or words[1] != "commit":
-        return False  # an assignment in front, another subcommand (`cat-file --batch` reads names): not judged
+        return False  # another subcommand (`cat-file --batch` reads names): not judged
     rest = iter(words[2:])
     for word in rest:
         if "$" in word or "`" in word:
@@ -748,6 +762,284 @@ def _commit_is_plain(text, stdin_message=False):
     return True
 
 
+def _commit_is_plain(text, stdin_message=False):
+    """_commit_words_plain for command text; text that does not parse is not plain."""
+    try:
+        words = shlex.split(text)
+    except ValueError:
+        return False
+    return _commit_words_plain(words, stdin_message)
+
+
+def _search_is_plain(words):
+    """Whether the words are a `grep`/`rg` whose only mention of a name is its pattern.
+
+    A file argument still counts, and so does any option that is not a plain flag.
+    """
+    if not words or words[0].rsplit("/", 1)[-1] not in ("grep", "rg"):
+        return False
+    pattern, positional = None, []
+    rest = iter(words[1:])
+    for word in rest:
+        if "$" in word or "`" in word:
+            return False  # `$'--pre=NAME'` is not decoded, and `$X` can be an option
+        if word == "--":
+            positional.extend(rest)
+            break
+        if word in ("-e", "--regexp"):
+            pattern = next(rest, "")
+        elif word.startswith("--regexp="):
+            pattern = word.partition("=")[2]
+        elif word.startswith("-") and len(word) > 1:
+            if not SEARCH_FLAGS_RE.match(word):
+                return False
+        else:
+            positional.append(word)
+    if pattern is None and positional:
+        positional = positional[1:]  # the first word is the pattern
+    return not any(_env_names(w) for w in positional)
+
+
+def _unsafe_names(text):
+    """The .env file names in text that are not example files."""
+    return [name for name in _env_names(text) if not SAFE_ENV_RE.fullmatch(name)]
+
+
+# What a mention is: one simple command whose text only names a file. Anything else that names a dotenv file
+# is denied, because a name in a call of several commands, a nested shell or a substitution can be made to
+# open the file by something else in the same call, and every attempt to prove otherwise was bypassed.
+MENTION_HELP = ("a mention is allowed only in one simple command (echo, printf, git commit -m, a grep pattern, "
+                "a heredoc to cat): split the call, or write the note with the Write tool")
+
+
+def _mention_denied(name, blocker):
+    return "`%s` is named %s; %s" % (_clip(name), blocker, MENTION_HELP)
+
+
+def _not_simple(command):
+    """Why a command is more than a plain mention of a name (a phrase), or None when it is one.
+
+    No substitution anywhere, a program the gate can name, no input redirect, and at most one file written.
+    """
+    words = command.assignments + command.argv + [word for _, word in command.redirects]
+    if any(word.subs for word in words):
+        return "in a command that holds a substitution"
+    if command.argv and (command.argv[0].dynamic or "/" in command.argv[0].text):
+        return "in a command whose program is an expansion or a path"
+    written = 0
+    for op, word in command.redirects:
+        if op not in (">", ">>"):
+            return "in a command that reads with `%s`" % op
+        if not (word.text.isdigit() or word.text == "-" or word.text.startswith("/dev/")):
+            written += 1
+    if written > 1:
+        return "in a command that writes more than one file"
+    return None
+
+
+
+def _shell_script_index(texts):
+    """The index of the script a shell runs with `-c`, or None."""
+    for index in range(1, len(texts)):
+        word = texts[index]
+        if not word.startswith("-") or word == "--":
+            return None  # the first operand: a script file, not `-c`
+        if not word.startswith("--") and "c" in word[1:]:
+            return index + 1 if index + 1 < len(texts) else None
+    return None
+
+
+def _command_reads(command, blocker, depth, cwd, uncertain_cwd, budget=None):
+    """A reason (truthy) when one parsed command reads an env file, else None.
+
+    A name is a read when it is an input redirect, an argument to a program outside the text allowlist,
+    inside a substitution, or in a heredoc fed to something that can open files. A name in text a
+    command only prints or stores (echo, printf, `git commit -m`, a grep pattern, a heredoc to cat) is a
+    mention, and a mention is allowed only in one simple command: `blocker` is a phrase saying why this
+    command is not one (it is one of several in the call, or inside a shell script), or None.
+    """
+    texts = [word.text for word in command.argv]
+    program = texts[0].rsplit("/", 1)[-1] if texts else ""
+    # Every `skey run` in the command is checked, not only one at the start: `env skey run ...`, `sudo skey run ...`
+    # and `skey run -- skey run ...` run it too, and none of them names a guarded file in its own words. Text a
+    # program only prints (`echo skey run --dotenv X`) is not a run.
+    runs = 0
+    for at in range(len(texts) - 1 if program not in TEXT_PRINTERS else 0):
+        if texts[at].rsplit("/", 1)[-1] != "skey" or texts[at + 1].rsplit("/", 1)[-1] != "run":
+            continue
+        runs += 1
+        if runs > MAX_RUNS:
+            return "more than %d `skey run` in one command" % MAX_RUNS
+        inner, dotenvs = _tv_run_command(texts[at + 2:])
+        for path in dotenvs:
+            # The values this run injects must be names, or no command can be trusted to keep them
+            # out of the transcript.
+            if not _dotenv_is_imported(path, cwd, uncertain_cwd):
+                return "`skey run --dotenv` was given a file that still holds plain values"
+        if inner:
+            # The payload is judged whatever the outer words name: `skey run -- skey run --dotenv NAME -- ...`
+            # has no guarded name of its own. Quoted again, as in _metadata_words. Past MAX_NESTED the call
+            # itself fails closed on a `--dotenv`.
+            reason = _bash_env_read(shlex.join(inner), depth + 1, cwd, uncertain_cwd, budget=budget)
+            if reason:
+                return reason
+    redirect_words = [word for _, word in command.redirects]
+    for word in command.assignments + command.argv + redirect_words:
+        # A shell substitution runs another command, so `ls $(cat NAME)` reads NAME whatever the outer
+        # command is. No exemption applies inside one: its output goes to the outer command.
+        for body in word.subs:
+            names = _unsafe_names(body)
+            if names:
+                return "a command substitution names `%s`" % _clip(names[0])
+            # A body with no name can still run `skey run --dotenv FILE` on a plaintext file (review round 7).
+            reason = _bash_env_read(body, depth + 1, cwd, uncertain_cwd, mentions=False, budget=budget)
+            if reason:
+                return reason
+    for word in command.assignments:
+        names = _unsafe_names(word.text)
+        if names:
+            return "an assignment names `%s`" % _clip(names[0])
+    for op, word in command.redirects:
+        names = _unsafe_names(word.text)
+        if names:
+            what = "opened for reading by `%s`" % op if op in ("<", "<>", "<<<") else "written by `%s`" % op
+            return "`%s` is %s" % (_clip(names[0]), what)
+    script = _shell_script_index(texts) if program in SHELLS else None
+    names = [name for index, text in enumerate(texts) if index != script for name in _unsafe_names(text)]
+    if names:
+        given = "`%s` is given `%s`" % (_clip(program), _clip(names[0]))
+        if command.argv[0].dynamic:
+            return given + ", and the program is an expansion"
+        if program in TEXT_PRINTERS:
+            why = blocker or _not_simple(command)
+            if why:
+                return _mention_denied(names[0], why)
+        elif _metadata_words(texts, depth, cwd, uncertain_cwd, budget):
+            pass  # reports names and hashes, never contents: allowed in any call, as before
+        elif (program == "git" and _commit_words_plain(texts)) or _search_is_plain(texts):
+            why = blocker or _not_simple(command)
+            if why:
+                return _mention_denied(names[0], why)
+        else:
+            return given
+    if script is not None:
+        # A script a shell runs is read for the checks that do not depend on a mention (a `skey run`
+        # with a dotenv file, a name used as a program argument), never as a place a mention is allowed.
+        reason = _bash_env_read(texts[script], depth + 1, cwd, uncertain_cwd, mentions=False, budget=budget)
+        if reason:
+            return reason
+    for heredoc in command.heredocs:
+        # A heredoc is a script when its receiver may run it: a shell, `env bash`, `sudo sh`, `bash -c 'sh'`, an
+        # interpreter. Only a known data sink or printer is not. Such a body is judged whether or not it spells a
+        # dotenv name, as a `-c` script is: its `skey run --dotenv FILE` can name any file (rounds 7, 8).
+        # A data sink is trusted only by bare name (`./cat` is some other program), and `git` only for a plain commit
+        # message (`git -c alias.r='!sh' r` runs a shell). An unquoted heredoc is expanded by the shell before any
+        # receiver reads it, so a substitution in it runs whatever the receiver is (round 9).
+        sink = program in DATA_SINKS and "/" not in texts[0] if texts else False
+        if sink and program == "git" and not _commit_words_plain(texts, stdin_message=True):
+            sink = False
+        runs_body = (bool(texts) and program not in TEXT_PRINTERS and not sink) or (
+            not heredoc.quoted and any(token in heredoc.body for token in ("$(", "`", "${")))
+        names = _unsafe_names(heredoc.body)
+        if runs_body and (program in SHELLS and script is None or not names):
+            reason = _bash_env_read(heredoc.body, depth + 1, cwd, uncertain_cwd, mentions=False, budget=budget)
+            if reason:
+                return reason
+            if program in SHELLS and script is None:
+                continue
+        if not names:
+            continue
+        where = "a heredoc"
+        if len(command.heredocs) > 1:
+            return "%s names `%s`, with more than one heredoc on the command" % (where, _clip(names[0]))
+        if not heredoc.quoted and any(token in heredoc.body for token in ("$(", "${", "`")):
+            return "an unquoted heredoc names `%s` and expands a substitution" % _clip(names[0])
+        if not texts or program in DATA_SINKS:
+            if program == "git" and not _commit_words_plain(texts, stdin_message=True):
+                return "a heredoc fed to `git %s`, which can read names from it" % _clip(texts[1] if len(texts) > 1 else "")
+            why = blocker or _not_simple(command)
+            if why:
+                return _mention_denied(names[0], why)
+        else:
+            return ("a heredoc naming `%s` is fed to `%s`, which can open the file; write the note with the "
+                    "editor tool or a heredoc to cat" % (_clip(names[0]), _clip(program)))
+    return None
+
+
+# Words that only prefix the command after them; the shell still runs that command itself.
+SHELL_PREFIXES = {"builtin", "command", "time", "!", "if", "then", "else", "elif", "do", "while", "until"}
+# A builtin that changes the directory without being `cd` or `pushd`. `source` and `.` are not here: a sourced
+# script may `cd`, but counting every `source venv/bin/activate` as a change refused ordinary lines main allows.
+RUNS_IN_SHELL = {"popd"}
+
+
+def _changes_directory(command):
+    """Whether one parsed command may change the shell's directory.
+
+    Reads past the words that only prefix a command (`builtin`, `command`, `time`, `!`, `then`...). A
+    program known only at run time (`$X /srv`) and an `eval` that can build its text count as a change, so the
+    answer errs towards "may". A sourced script that changes directory is not followed (a known gap).
+    """
+    words = list(command.argv)
+    while words:
+        if words[0].dynamic or words[0].subs:
+            return True  # `$X /srv`: the program is only known when the shell runs
+        name = words[0].text.rsplit("/", 1)[-1]
+        if name == "eval":
+            return True  # the script is built from its arguments (quotes, braces, $IFS), so it cannot be read here
+        if name not in SHELL_PREFIXES:
+            return name in CHANGES_DIRECTORY or name in RUNS_IN_SHELL
+        words = [word for word in words[1:] if not word.text.startswith("-")]
+    return False
+
+
+def _bash_env_read(command, depth=0, cwd=None, uncertain_cwd=False, mentions=True, budget=None):
+    """A reason (truthy) when the Bash command reads an env file, else None.
+
+    The command is read as shell (see shellparse); text it cannot read is judged by the names it holds.
+    mentions: False for a script a shell runs (`bash -c`, a heredoc to `bash`), where no name is a mention.
+    """
+    if depth > MAX_NESTED:
+        names = _unsafe_names(command)
+        if names:
+            return "a command nested deeper than %d names `%s`" % (MAX_NESTED, _clip(names[0]))
+        if "--dotenv" in re.sub(r"[\"'\\]", "", command):  # `--do''tenv` is the same flag
+            return "`--dotenv` is in a command nested deeper than %d" % MAX_NESTED
+        return None
+    if budget is None:
+        budget = [MAX_PARSE_BUDGET]
+    budget[0] -= len(command)
+    if budget[0] < 0:
+        return "a command the gate would take too long to read (its nested scripts and payloads are too large)"
+    try:
+        commands = shellparse.parse(command)
+    except RecursionError:
+        return "a command nested too deeply for the gate to read"
+    if commands is None:
+        # A line continuation splits a name in the text (`.e\<newline>nv`) that the shell reads whole.
+        names = _unsafe_names(command.replace("\\\n", ""))
+        if names:
+            return "`%s` is in a command the gate cannot read as shell (`$'...'`, `${...}`, a subshell, a loop)" % (
+                _clip(names[0]))
+        if "--dotenv" in command:
+            return "`--dotenv` is in a command the gate cannot read as shell"
+        return None
+    # A command that changes directory makes a relative path
+    # unresolvable, so the file it names cannot be checked.
+    # A nested shell inherits the outer command's change (`cd /x && bash -c '... .env'`).
+    uncertain_cwd = uncertain_cwd or any(_changes_directory(c) for c in commands)
+    blocker = None
+    if not mentions:
+        blocker = "in a script run by a shell"
+    elif len(commands) > 1:
+        blocker = "in a call of several commands"
+    for command_ in commands:
+        reason = _command_reads(command_, blocker, depth, cwd, uncertain_cwd, budget)
+        if reason:
+            return reason
+    return None
+
+
 def _strip_data_heredocs(command):
     """The command without the bodies of heredocs that only hand text to a data sink.
 
@@ -759,6 +1051,9 @@ def _strip_data_heredocs(command):
     if "<<" not in command:
         return command
     lines, out, index = command.split("\n"), [], 0
+    closers = {}  # stripped line -> its line numbers, so a closing line is found by bisection, not by a scan
+    for number, text in enumerate(lines):
+        closers.setdefault(text.strip(), []).append(number)
     while index < len(lines):
         line = lines[index]
         out.append(line)
@@ -779,7 +1074,9 @@ def _strip_data_heredocs(command):
             continue  # other git commands read names from stdin (`git cat-file --batch`)
         if re.search(r"[|;&`$(){}]", before):
             continue
-        end = next((i for i in range(index, len(lines)) if lines[i].strip() == match.group(2)), None)
+        where = closers.get(match.group(2), [])
+        at = bisect.bisect_left(where, index)
+        end = where[at] if at < len(where) else None
         if end is None:
             continue
         body = lines[index:end]
@@ -788,56 +1085,6 @@ def _strip_data_heredocs(command):
         out.append(lines[end])
         index = end + 1
     return "\n".join(out)
-
-
-def _only_mentions(segment, command):
-    """Whether the segment only names an env file in text it prints, stores or searches for.
-
-    That is `echo` and `printf` (when nothing pipes or reads their output), `git commit -m`, and a
-    `grep`/`rg` whose pattern is the name. None of them prints the file; a file argument still counts.
-    """
-    words = _words(segment)
-    if not words:
-        return False
-    program = words[0].rsplit("/", 1)[-1]
-    if re.search(r"[&(){}`]", segment):
-        # A single `&` starts another command in the same segment (`echo ok & cat NAME`), and the rest
-        # can nest one; a mention is judged only when the segment is a plain command.
-        return False
-    if program in ("echo", "printf"):
-        # The text can be fed to a program that opens the name: `echo NAME | xargs cat`.
-        # A redirect can write a script that a later command runs: `echo 'cat NAME' > s.sh && bash s.sh`.
-        return not re.search(r"[|`>]|<<<|\b(?:xargs|read|eval|source)\b", command)
-    if program == "git":
-        return _commit_is_plain(segment)
-    if program in ("grep", "rg"):
-        try:
-            words = shlex.split(segment)  # as the shell reads it: `'--pre=NAME'` is an option, not a pattern
-        except ValueError:
-            return False
-        if not words or words[0].rsplit("/", 1)[-1] not in ("grep", "rg"):
-            return False
-        pattern, positional = None, []
-        rest = iter(words[1:])
-        for word in rest:
-            if "$" in word or "`" in word:
-                return False  # shlex does not decode `$'--pre=NAME'`, and `$X` can be an option
-            if word == "--":
-                positional.extend(rest)
-                break
-            if word in ("-e", "--regexp"):
-                pattern = next(rest, "")
-            elif word.startswith("--regexp="):
-                pattern = word.partition("=")[2]
-            elif word.startswith("-") and len(word) > 1:
-                if not SEARCH_FLAGS_RE.match(word):
-                    return False
-            else:
-                positional.append(word)
-        if pattern is None and positional:
-            positional = positional[1:]  # the first word is the pattern
-        return not any(_env_names(w) for w in positional)
-    return False
 
 
 def _is_tv_run(segment):
@@ -853,48 +1100,49 @@ def _tv_run_dotenvs(segment):
     return _tv_run_command(_words(segment)[2:])[1]
 
 
+def _text_skey_run_reads(command, cwd):
+    """A reason (truthy) when a `skey run` in the command text injects a dotenv file that holds plain values.
+
+    The check main has always made, on the text and not on the parsed command: data-sink heredocs removed,
+    cut at `&&`, `||`, `;`, `|` and newlines, and each piece that starts with `skey run` read for its files.
+    It is a floor: the parser-based reading may deny more, never less. What a `skey run` hides from this
+    (a wrapper, a nested run, a quoted script) is covered by the run's own output filter.
+    """
+    segments = re.split(r"&&|\|\||[;|\n]", _strip_data_heredocs(command))
+    # A command that changes directory makes a relative path unresolvable, so the file it names cannot be checked.
+    uncertain_cwd = any(_words(segment) and _words(segment)[0].rsplit("/", 1)[-1] in CHANGES_DIRECTORY
+                        for segment in segments)
+    for segment in segments:
+        if _is_tv_run(segment):
+            for path in _tv_run_dotenvs(segment):
+                # The values this run injects must be names, or no command can be trusted to keep them out
+                # of the transcript.
+                if not _dotenv_is_imported(path, cwd, uncertain_cwd):
+                    return "`skey run --dotenv` was given a file that still holds plain values"
+    return None
+
+
 def _reads_env_file(tool, tool_input, depth=0, cwd=None):
+    """A reason (truthy) when the tool call reads an env file, else False."""
     if tool == "Bash":
         command = tool_input.get("command", "")
         if not isinstance(command, str):
             return False
-        command = _strip_data_heredocs(command)
-        segments = re.split(r"&&|\|\||[;|\n]", command)
-        # A command that changes directory makes a relative path
-        # unresolvable, so the file it names cannot be checked.
-        uncertain_cwd = any(_words(segment) and _words(segment)[0].rsplit("/", 1)[-1] in CHANGES_DIRECTORY
-                            for segment in segments)
-        for segment in segments:
-            # A `skey run` is checked even when it names no .env: the file it
-            # injects is the thing that matters, and its name can be anything.
-            if _is_tv_run(segment):
-                for path in _tv_run_dotenvs(segment):
-                    # The values this run injects must be names, or no command
-                    # can be trusted to keep them out of the transcript.
-                    if not _dotenv_is_imported(path, cwd, uncertain_cwd):
-                        return True
-            # A shell substitution runs another command, so `ls $(cat .env)` is
-            # a read of .env whatever the outer command is.
-            for part in [segment] + _substitutions(segment):
-                names = _env_names(part)
-                if not names:
-                    continue
-                # Every name has to be safe. One safe name does not vouch for
-                # the rest: `cat .env.example .env` reads both files.
-                if all(SAFE_ENV_RE.fullmatch(name) for name in names):
-                    continue
-                if part is segment and not _has_substitution(segment) and (
-                        _is_metadata(part, depth, cwd) or _only_mentions(part, command)):
-                    continue
-                return True
-        return False
+        # Main's check, kept as it was: the text is cut at every separator, quotes ignored, so a `skey run` after one
+        # is judged wherever it sits (`bash -c 'true; skey run --dotenv F -- cmd'`, `wc $(true; skey run ...)`).
+        # The parser-based reading below adds to it and never replaces it.
+        _DOTENV_CALL["checked"], _DOTENV_CALL["bytes"] = {}, 0
+        reason = _text_skey_run_reads(command, cwd)
+        if reason:
+            return reason
+        return _bash_env_read(command, depth, cwd) or False
     if tool in PATH_FIELDS:
         # Each field on its own, so a safe path in one field cannot cover an
         # unsafe path in another.
         for field in PATH_FIELDS[tool]:
-            names = _env_names(str(tool_input.get(field, "")))
-            if any(not SAFE_ENV_RE.fullmatch(name) for name in names):
-                return True
+            names = _unsafe_names(str(tool_input.get(field, "")))
+            if names:
+                return "the `%s` of this %s call names `%s`" % (field, tool, _clip(names[0]))
         return False
     return False
 
@@ -971,10 +1219,13 @@ def pre_tool_use(event, secrets):
                      "not the agent. To not wait, file a request with `skey request rotate|sync|config ...` "
                      "and carry on: the user approves it later. (Matched: %s. In written text, describe the "
                      "command instead of quoting it.)" % matched)
-    if _reads_env_file(tool, tool_input, cwd=event.get("cwd")):
-        return _deny("securikey: reading .env files puts secret values in the transcript. Run "
+    reads = _reads_env_file(tool, tool_input, cwd=event.get("cwd"))
+    if reads:
+        return _deny("securikey: reading .env files puts secret values in the transcript (matched: %s). Run "
                      "`skey import <file>` once (values move to the keychain, the file keeps names), then "
-                     "`skey run --dotenv <file> -- <command>`. .env.example files are allowed.")
+                     "`skey run --dotenv <file> -- <command>`. .env.example files are allowed, and so is "
+                     "one simple command that only names the file in text it prints or stores (echo, printf, "
+                     "`git commit -m`, a grep pattern, a heredoc to cat)." % reads)
     return None
 
 
