@@ -8,6 +8,7 @@ description: Handles API keys, tokens, passwords and .env files without ever exp
 Secrets live in the OS keychain. You work with their **names**; values reach only the process that needs them. Hooks block any tool call or prompt that contains a secret and redact secrets from tool output before you see it, for calls that succeed and for commands started with `skey run`. Output of a *failing* command that did not go through `skey run` is not redacted.
 
 ## Rules
+- A new random secret (JWT secret, DB password, webhook secret): run `skey gen <name>` yourself. It makes the value, stores it and prints only that it did, so you never see it; use it with `skey run --env VAR=<name> -- <command>`. It refuses a name that exists (replacing a value is the user's). Never generate a value in shell and pipe it in.
 - Never ask the user to paste a secret into the chat. Ask them to run `skey add <name>` **in their own terminal** (it prompts with hidden input). Names: lowercase letters, digits, `_`.
 - Never put a secret value in a command, file, or message. Never try to recover a redacted value (`[securikey:NAME]`, `[redacted:KIND]`): the redaction is the point.
 - Don't read `.env` files (a hook blocks it). `.env.example` is fine.
@@ -21,10 +22,12 @@ Secrets live in the OS keychain. You work with their **names**; values reach onl
 | Make a .env safe to commit | `skey import .env` (values move to the keychain; the file keeps `securikey:<name>`), `--dry-run` first |
 | Remove a secret | `skey rm <name>` |
 | A stored value that is configuration, not a secret (a local server address) and keeps getting blocked | the user runs `skey add --config <name>`, or `skey config <name> on` for an entry that exists, in their own terminal (they refuse to run from you: a marked value is no longer redacted). `skey list` shows `(config)`. Storing a new value makes it a secret again |
-| Replace a secret's value | the user runs `skey rotate <name>` in their own terminal (the old value stays redacted for 7 days) |
+| Replace a secret's value | the user runs `skey rotate <name>` in their own terminal (the old value stays redacted for 7 days). Do not wait: file `skey request rotate <name> --generate --reason "<why>"` (`--generate` makes the new value without anyone seeing it; leave it out when the user must supply it) and carry on |
+| Any other command only the user can run (`sync`, `config`) | `skey request sync paperclip` or `skey request config <name> on\|off`, then carry on. The user answers with `skey approve` at their terminal; `skey pending` shows what became of it. A request holds no value, and approving it is the user's decision, so never ask them to approve it in chat |
 | Create the keychain's names in Paperclip | the user runs `skey sync paperclip` in their own terminal (a hook refuses `skey sync` and `skey rotate` from you: they send values to a server) |
 | Use a secret Paperclip granted this run | `skey run --env-from-paperclip VAR=key -- <command>` |
 | Check the setup before an unattended run | `skey doctor --headless` |
+| Find out which of several keys a service holds (it rejects one with 403), without anyone revealing a value | the user hashes each copied candidate in their own terminal and you compare 12-character prefixes: see [references/compare-by-hash.md](references/compare-by-hash.md) |
 
 `skey run` passes the command's exit status through and redacts any secret in its stdout and stderr itself, **even when the command fails**. Claude Code skips the redaction hook for any other command that exits non-zero, so a secret such a command prints reaches you unredacted: run commands that handle a secret through `skey run`.
 

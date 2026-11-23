@@ -1,5 +1,48 @@
 # Changelog
 
+## [3.5.0] - 2026-11-23
+
+### Added
+- `skey request rotate|sync|config ...`, `skey pending` and `skey approve [id]`: an agent that needs a command only you may run files a request and carries on instead of waiting in the chat. You answer from your terminal when it suits you: each request is shown with what it will do (a sync names the server it sends to, marking configuration says the value stops being redacted), then yes, no or skip. A request holds no value. Requests live in `~/.cache/securikey/requests-<service>.json` (owner only, 20 waiting at most, dropped after a week; answered ones stay a day).
+- `skey rotate <name> --generate` makes the new value inside the process, so a rotation needs nobody to type or see it. Also what a request can ask for.
+- The hook's refusal of the human-only commands now says how to file a request.
+
+### Gotchas
+- This saves waiting, not protection. `approve` runs only at a terminal, the same check as the commands themselves, and the agent can write the queue file as well as you can read it: entries are validated on every read, the question is built from fields (the agent's reason is shown but labelled), and approving applies the copy you were shown. A forged "approved" entry does nothing. Details in `docs/limits.md`.
+- It reverses nothing the earlier decision against an out-of-band confirmation code ruled out: there is still no way to stop an agent that opens its own pseudo-terminal or uses `skey run --env`.
+
+## [3.4.0] - 2026-11-23
+
+### Added
+- `skey gen <name> [--bytes N] [--hex]`: the process makes a random value, stores it under a new name and prints only `stored <name> (generated, N bytes)`. An agent can now create a secret it needs (a JWT secret, a database password) without waiting for you and without generating a value in shell and piping it in, so it never types a guarded command or sees the value. 16 to 1024 bytes, 32 by default; the result is always a secret (there is no `--config`).
+
+### Gotchas
+- It refuses a name that already exists, because replacing a value is a rotation and that stays terminal-only. The terminal check on rotate, sync and config is unchanged, and so is the hook: `gen` needs no new rule.
+- Not covered: a credential that a provider issues (a GitHub or Stripe key) cannot be generated locally, and the terminal-only commands still need you. An approval queue for those is designed but not built.
+
+## [3.3.1] - 2026-11-18
+
+### Added
+- Skill reference `plugin/skills/securikey/references/compare-by-hash.md`: how to find out which of several keys a service holds without anyone revealing one. The user hashes a copied candidate (`pbpaste | shasum -a 256 | cut -c1-12`) and the agent compares the prefix with the digest the service's CLI lists (`supabase secrets list` shows a plain SHA-256). Found in a Supabase session where the functions held the new `sb_secret_` key while the docs said the legacy JWT, and the wrong key gave a bare 403.
+
+### Gotchas
+- Check that a CLI's digest is a plain SHA-256 first, by hashing a non-secret value stored the same way. The first hash in that session matched the public key, not the intended one: the clipboard held the wrong key.
+
+## [3.3.0] - 2026-11-17
+
+Secret redaction and blocking for Mistral Vibe, Pi and OpenCode (issue #30).
+
+### Added
+- `skey hook <pre|post|failure|prompt> --host vibe|pi|opencode`: reads the harness's own payload, maps it to the Claude event (tool and field names such as `bash`, `read_file`, `filePath`, `process_write` bytes in base64), runs the existing hooks and answers in the harness's shape. The matching code is not copied: `plugin/securikey/hosts.py` only translates. A payload it cannot read, a crash or a bad event is a deny (a withheld output for the output hook) and exit 1, which Vibe's `strict` and the shims read as a block.
+- `skey setup vibe|pi|opencode [--remove]` writes the shims into the harness's home with the absolute paths of `uv` and `skey` filled in: a Vibe plugin (`plugin.json` plus `ai.mistral.vibe/hooks.toml`, `strict`, 15 s, for `pre_tool`, `post_tool` and `pre_agent`), a Pi extension and an OpenCode V2 plugin (`plugin/harness/`). It runs only from your own terminal, refuses a `skey` inside the versioned plugin cache and a file it did not write, and `--remove` deletes only what carries its marker. `SECURIKEY_HOST_BYPASS=1` in the harness's environment turns the hooks off for that run.
+- Failed calls are redacted in all three harnesses, not only warned about: their hooks can rewrite an error, which Claude Code's cannot.
+- `python bench/hook_cost.py` also times `--host vibe` (p95 about 115 ms against the 150 ms budget).
+
+### Gotchas
+- Vibe keeps the original tool output, tool input and a blocked prompt in its session journal, and does not run the hooks on the `run_typescript` call itself (only on the tools a script calls). The shims in the harness home can be edited by an agent that may write there. All in `docs/limits.md`.
+- OpenCode V2 hooks return nothing: they change the event they get, and a throw in `execute.before` or the prompt hook blocks. The V1 plugin format (`tool.execute.before` in a returned object) does not load in 2.2.x.
+- Pi's `tool_result` drops `structuredContent` when `content` is replaced, and bash puts the output in both, so the shim returns a redacted copy of each.
+
 ## [3.2.0] - 2026-11-09
 
 ### Added

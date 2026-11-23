@@ -968,8 +968,9 @@ def pre_tool_use(event, secrets):
         return _deny("securikey: `skey sync` and `skey rotate` send secret values to a server, and the "
                      "address can be set on the command line; `skey config` and `skey add --config` stop a "
                      "stored value being redacted. So you run them in your own terminal, "
-                     "not the agent. (Matched: %s. In written text, describe the command instead of "
-                     "quoting it.)" % matched)
+                     "not the agent. To not wait, file a request with `skey request rotate|sync|config ...` "
+                     "and carry on: the user approves it later. (Matched: %s. In written text, describe the "
+                     "command instead of quoting it.)" % matched)
     if _reads_env_file(tool, tool_input, cwd=event.get("cwd")):
         return _deny("securikey: reading .env files puts secret values in the transcript. Run "
                      "`skey import <file>` once (values move to the keychain, the file keeps names), then "

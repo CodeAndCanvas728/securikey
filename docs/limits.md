@@ -40,8 +40,37 @@ What is still exposed: a command that fails and printed a secret it did not get 
 - A base64 secret that happens to look like a path (`/abc.../xyz...`, about 1 in 170) is not redacted. A cloned repo can make the scan register words of its choosing (`A_SECRET=JavaScript`), so calls that carry them are denied: a nuisance, not a leak, and the label names `dotenv:KEY`.
 - A dotenv file that holds `securikey:<name>` references only resolves when the command is started through `skey run --dotenv`. An application that reads the file itself sees the marker, not the value.
 
+## Other harnesses: Vibe, Pi, OpenCode
+
+`skey setup vibe|pi|opencode` installs shims that send each harness's payload to `skey hook <kind> --host <name>`, which maps it to the Claude event and runs the same checks. Checked against Vibe 3.1.2, Pi 1.5.2 and OpenCode 2.2.7 with a stub model server and a fake secret: a tool call holding the secret is denied, a command that prints it shows the model `[securikey:env:NAME]`, a failing command is redacted too (better than Claude Code, which cannot rewrite a failed call: Vibe's `post_tool`, Pi's `tool_result` and OpenCode's `execute.after` can), a prompt holding it is blocked, a broken `skey` path blocks the session, and `SECURIKEY_HOST_BYPASS=1` passes everything.
+
+| | Vibe | Pi | OpenCode |
+|---|---|---|---|
+| Call input with a secret | denied (`pre_tool`), also for tools called inside `run_typescript` | denied (`tool_call`) | denied (`execute.before`, a throw blocks) |
+| Output | replaced by the redacted text (`post_tool`) | `content`, `details` and `structuredContent` redacted (`tool_result`) | `content` and `output` redacted (`execute.after`) |
+| Prompt | blocked (`pre_agent`) | blocked (`input`) | blocked (`session` prompt hook, a throw blocks) |
+
+- **Not covered:** anything a harness wrote down before a hook ran, and what it keeps. Vibe's session journal under `~/.vibe/logs/session/` holds the original tool output, the tool call's input and a blocked prompt (seen on 3.1.2): the redaction protects what the model sees, not that file. OpenCode's stored history was not checked.
+- **Vibe's `run_typescript`:** Vibe runs the hooks for the tools a script calls (`tools.file_system.bash` and the like), not for the `run_typescript` call itself. A script that returns a value it holds in its own code is not checked.
+- **The agent can edit the hook files.** They sit in the harness's home (`~/.vibe/plugins/securikey`, Pi's `extensions`, OpenCode's `plugins`), and nothing here stops an agent that is allowed to write there from changing them. Protect them with the harness's own guards or file modes.
+- **Names the guards know:** the shell and dotenv guards are keyed on each harness's built-in tool names (`bash`, `read`, `edit`, `grep`, `shell`, `read_file`, `process_start`, `process_write`, ...). A tool with another name (an MCP tool) still has every string in its input scanned for secrets, but is not read as a shell command or a file path. A call whose command or path cannot be read is denied, and so is one whose `command` and `cmd` (or `path`, `filePath` and `file_path`) hold different values: the guards judge one and the harness may act on the other.
+- **Vibe's `process_write`** is judged one write at a time, as a command line. Input split across writes to a shell that is already running (`cat ` then the file name) is not put back together: each hook is a fresh process with no memory of the earlier writes. A secret in any one write is still denied.
+- **What is scanned in a prompt:** its text. Attached files and images are not.
+- **If OpenCode makes an error message read-only,** the plugin cannot rewrite it and the original text reaches the model without a notice (an `execute.after` hook cannot block). It was writable on 2.2.7.
+- **An OpenCode tool error** (`status: "error"`, such as invalid arguments) has its message rewritten through `event.error.message`; the model saw the rewritten text. This was checked with a stand-in message, not with a secret in a real error.
+- **Cost:** each hook starts `uv` once, as in Claude Code (p95 under 120 ms, measured by `python bench/hook_cost.py`). A hook that takes over 15 seconds is a failed check: the first keychain read after a reboot can ask for permission, so run `skey list` once from your terminal.
+- `skey setup` runs only from your own terminal, because removing the hooks switches the protection off.
+
+## Requests from an agent
+
+`skey request` lets an agent queue a rotation, a sync or a configuration mark instead of waiting for you. It is a convenience, not a new control:
+
+- The queue file is yours to read and the agent's to write (same user). Every entry is validated each time it is read, the text you are asked about is built from its fields and not from the agent's words (the agent's reason is shown, labelled as its own), and approving applies the copy you were shown, not a second read of the file. A forged "approved" entry runs nothing: only `skey approve` runs anything, and it refuses without a terminal. A writer can still mark a waiting request answered, which removes it from the queue without anyone saying yes; the agent could already delete the file. A name in the file that is not a stored secret (it may be a pasted value) is never printed, and a request whose reason holds a stored value or a token pattern is refused.
+- The guarantee is the one the terminal check already gives. A process that opens its own pseudo-terminal can run `skey approve` and answer yes, exactly as it could run the commands directly, and `skey run --env` already hands a value to any command an agent picks.
+- A request for a rotation with `--generate` makes the new value inside the process: nobody sees it, the agent included. The old value stays redacted for the usual seven days.
+
 ## Other
 
-- The hooks are Claude Code only. The `skey` CLI works from any agent or shell.
+- The hooks in the plugin are Claude Code's. Vibe, Pi and OpenCode get the same checks from `skey setup` (previous section). The `skey` CLI works from any agent or shell.
 - macOS and Linux are supported. On Linux the keychain needs a Secret Service provider (GNOME Keyring or KWallet). Windows is untested.
 - `skey sync` and `skey rotate` are for your own terminal. The pre-hook denies a Bash call that names them (also nested, quoted or behind an expansion), but a text match on shell is never complete, and a process that opens its own pseudo-terminal gets past the terminal check: these are layers, not a sandbox. A command longer than 16 KB that names `skey`, `sync` or `rotate` is denied without being parsed.

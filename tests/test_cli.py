@@ -47,6 +47,45 @@ class AddListRmTest(unittest.TestCase):
         self.assertEqual(run_cli(["rm", "a_key"], store)[0], 1)
 
 
+class GenTest(unittest.TestCase):
+    def test_gen_stores_a_value_of_the_right_size_and_never_prints_it(self):
+        store = MemoryStore()
+        code, out, err = run_cli(["gen", "jwt_secret"], store)
+        value = store.secrets["jwt_secret"]
+        self.assertEqual(code, 0)
+        self.assertGreaterEqual(len(value), 43)  # 32 bytes, URL-safe base64
+        self.assertNotIn(value, out + err)
+        self.assertIn("jwt_secret", out)
+
+    def test_gen_hex_and_bytes(self):
+        store = MemoryStore()
+        self.assertEqual(run_cli(["gen", "db_pass", "--hex", "--bytes", "20"], store)[0], 0)
+        self.assertRegex(store.secrets["db_pass"], r"^[0-9a-f]{40}$")
+
+    def test_gen_values_differ(self):
+        store = MemoryStore()
+        run_cli(["gen", "one_key"], store)
+        run_cli(["gen", "two_key"], store)
+        self.assertNotEqual(store.secrets["one_key"], store.secrets["two_key"])
+
+    def test_gen_refuses_an_existing_name_and_keeps_its_value(self):
+        store = MemoryStore({"api_key": SECRET})
+        code, out, err = run_cli(["gen", "api_key"], store)
+        self.assertEqual((code, store.secrets), (1, {"api_key": SECRET}))
+        self.assertNotIn(SECRET, out + err)
+
+    def test_gen_rejects_bad_names_and_sizes(self):
+        store = MemoryStore()
+        self.assertEqual(run_cli(["gen", "Bad-Name"], store)[0], 1)
+        self.assertEqual(run_cli(["gen", "ok_name", "--bytes", "4"], store)[0], 1)
+        self.assertEqual(run_cli(["gen", "ok_name", "--bytes", "5000"], store)[0], 1)
+        self.assertEqual(store.secrets, {})
+
+    def test_the_hook_lets_an_agent_run_gen(self):
+        from securikey import hooks
+        self.assertIsNone(hooks._runs_human_only("skey gen api_key --bytes 24"))
+
+
 class HelpAndInterruptTest(unittest.TestCase):
     def test_every_subcommand_has_a_help_line_and_the_usage_text_is_shown(self):
         out = io.StringIO()

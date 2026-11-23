@@ -3,12 +3,16 @@
   skey add <name>                     value from a hidden prompt or stdin, never from the command line
   skey add --config <name>            store a value that is configuration, not a secret (your terminal only)
   skey config <name> on|off           mark a stored entry as configuration, or back to secret (your terminal only)
+  skey gen <name> [--bytes N] [--hex]  store a new random secret; the value is never shown
+  skey request rotate|sync|config ...   ask for a command only the user can run, and carry on; they approve it
+  skey pending                         the requests waiting, and what became of the answered ones
+  skey approve [id]...                 answer the requests, at your own terminal
   skey list | skey rm <name>
   skey run [--env VAR=name]... [--dotenv FILE]... [--env-from-paperclip VAR=key]... -- <command...>
   skey import <.env file> [--all] [--dry-run]   move values into the keychain, leave `securikey:<name>`
   skey migrate [--dry-run] [--purge-old]   copy secrets from the pre-3.0.0 keychain item (service token-vault)
   skey sync paperclip [--only a,b] [--update] [--dry-run]   create the keychain's names as Paperclip company secrets
-  skey rotate <name> [--keep-days N]  new value; the old one stays redacted for N days; updates Paperclip too
+  skey rotate <name> [--keep-days N] [--generate]  new value; the old one stays redacted for N days; updates Paperclip too
   skey doctor [--headless]            check what would stall an unattended agent (uv, keychain, Claude Code, install)
   skey hook pre|post|failure|prompt   Claude Code hook entry point (reads the event JSON on stdin)
   skey warm                            resolve the runtime and unlock the keychain once, at session start
@@ -22,11 +26,13 @@ import json
 import os
 import re
 import sys
+import secrets as _random
 import tempfile
+import time
 
-from securikey import audit, doctor, hooks, migrate, paperclip, runfilter
+from securikey import approvals, audit, doctor, harnesses, hooks, hosts, migrate, paperclip, runfilter
 from securikey.dotenv import LEGACY_REF_PREFIX, REF_PREFIX, is_ref, parse_dotenv, parse_ref, secret_like
-from securikey.redact import MIN_SECRET_LEN, PATTERNS, known_forms
+from securikey.redact import MIN_SECRET_LEN, PATTERNS, known_forms, redact
 from securikey.store import (LEGACY_SERVICE, KeychainStore, VaultError, check_name, config_names, is_headless,
                              value_mark)
 
@@ -54,6 +60,31 @@ def cmd_add(args, store):
         if args.config:
             store.save_config({**store.load_config(), name: value_mark(value)})
     print("stored %s%s" % (name, " (non-secret configuration)" if args.config else ""))
+
+
+GEN_MIN_BYTES, GEN_MAX_BYTES, GEN_DEFAULT_BYTES = 16, 1024, 32
+
+
+def _random_value(nbytes, hex_digits=False):
+    return _random.token_hex(nbytes) if hex_digits else _random.token_urlsafe(nbytes)
+
+
+def cmd_gen(args, store):
+    """Store a new random secret under a name that is free. The value is made here and never printed, so the
+    caller (an agent) learns only that it exists. An existing name is refused: replacing a value is a rotation."""
+    name = check_name(args.name)
+    if not GEN_MIN_BYTES <= args.bytes <= GEN_MAX_BYTES:
+        raise VaultError("--bytes is between %d and %d" % (GEN_MIN_BYTES, GEN_MAX_BYTES))
+    value = _random_value(args.bytes, args.hex)
+    with store.transaction():
+        stored = store.load()
+        if name in stored:
+            raise VaultError("%s already exists; replacing a value is a rotation, which you run from your own "
+                             "terminal (skey rotate %s)" % (name, name))
+        stored[name] = value
+        store.save(stored)
+    print("stored %s (generated, %d bytes)" % (name, args.bytes))
+    audit.record(store.service, "gen", [name], ())
 
 
 def cmd_config(args, store):
@@ -324,7 +355,24 @@ def cmd_hook(args, store):
         # the reason.
         print("skey: malformed hook event: %s" % exc, file=sys.stderr)
         raise SystemExit(1)
+    if args.host:
+        return _host_hook(args, event, store)
     out = hooks.handle(args.kind, event, store)
+    if out:
+        print(json.dumps(out))
+
+
+def _host_hook(args, event, store):
+    """A hook event from another harness (Vibe, Pi, OpenCode). Anything that stops it judging the event
+    answers in the harness's own shape with a deny or a withheld output, and exits 1, which the harness
+    shims and Vibe's `strict` read as a block."""
+    try:
+        out = hosts.run(args.host, args.kind, event, store)
+    except Exception as exc:  # noqa: BLE001 - an event that cannot be judged must not pass
+        reason = "securikey: the check failed (%s: %s), so the call was not judged." % (type(exc).__name__, exc)
+        print("skey: %s" % reason, file=sys.stderr)
+        print(json.dumps(hosts.fail_response(args.host, args.kind, reason)))
+        raise SystemExit(1)
     if out:
         print(json.dumps(out))
 
@@ -397,6 +445,23 @@ def require_terminal(what, why=SEND_WHY):
                          "(not from an agent, a script or an unattended run)" % (what, why))
 
 
+SETUP_WHY = "changes what runs around every tool call of another harness, and removing it switches the redaction off"
+
+
+def cmd_setup(args, store):
+    """Install the securikey hooks into Vibe, Pi or OpenCode, or take them out again."""
+    require_terminal("setup", SETUP_WHY)
+    if args.remove:
+        paths = harnesses.remove(args.harness)
+        print("skey: removed %s" % (", ".join(map(str, paths)) if paths else "nothing (not installed)"))
+        return
+    paths = harnesses.install(args.harness)
+    print("skey: installed the %s hooks:" % args.harness)
+    for path in paths:
+        print("  %s" % path)
+    print("%s Bypass: start the harness with %s=1." % (harnesses.RELOAD[args.harness], hosts.BYPASS_ENV))
+
+
 def cmd_sync(args, store):
     """Create the keychain's secrets as Paperclip company secrets. Prints names, actions and ids only."""
     require_terminal("sync")
@@ -446,7 +511,7 @@ def cmd_rotate(args, store):
     name = check_name(args.name)
     if args.keep_days < 0:
         raise VaultError("--keep-days is zero or more")
-    value = _read_value(name)
+    value = _random_value(GEN_DEFAULT_BYTES) if args.generate else _read_value(name)
     retired = False
     with store.transaction():
         secrets = store.load()
@@ -482,6 +547,149 @@ def cmd_rotate(args, store):
     print("updated Paperclip secret %s" % secret_id)
 
 
+APPROVE_WHY = "runs the commands that only you may run"
+
+
+def _request_options(args):
+    if args.op == "rotate":
+        return args.name, {"keep_days": args.keep_days, "generate": args.generate}
+    if args.op == "config":
+        return args.name, {"state": args.state}
+    return "paperclip", {"only": args.only, "update": args.update}
+
+
+def cmd_request(args, store):
+    """File a request for a command that needs the user, and return at once. Holds no value."""
+    name, options = _request_options(args)
+    stored = store.load()
+    if args.op != "sync":
+        name = check_name(name)
+        if name not in stored:
+            raise VaultError("no secret named %s (skey gen %s makes one)" % (name, name))
+    elif options["only"] and any(n.strip() not in stored for n in options["only"].split(",")):
+        # Not echoed: a name that is not in the keychain may be a pasted value.
+        raise VaultError("--only names a secret that is not in the keychain")
+    if args.reason and redact(args.reason, stored)[1]:
+        raise VaultError("the reason contains a secret; say why in words")
+    entry, created = approvals.add(store.service, args.op, name, options, args.reason or "")
+    print("%s %s: %s. The user answers it from their own terminal with `skey approve`; carry on with other "
+          "work, and `skey pending` shows what became of it." % ("queued" if created else "already queued",
+                                                                    entry["id"], _describe(entry, short=True)))
+    audit.record(store.service, "request", [] if args.op == "sync" else [name], ())
+
+
+def _names(entry):
+    only = entry["options"].get("only") if entry["op"] == "sync" else None
+    return [n.strip() for n in only.split(",")] if only else ([] if entry["op"] == "sync" else [entry["name"]])
+
+
+def _stored(entry, stored):
+    """Whether every name the entry mentions is a stored secret. The file can hold anything the agent wrote, and
+    a name there may be a pasted value, so a name that is not stored is never printed."""
+    return all(n in stored for n in _names(entry))
+
+
+def _describe(entry, short=False):
+    """What approving the entry will do, from its fields only (never from the agent's own words)."""
+    op, name, o = entry["op"], entry["name"], entry["options"]
+    if op == "rotate":
+        new = "a new value made here, shown to nobody" if o["generate"] else "a new value you type"
+        keep = "the old one stays redacted %d day(s)" % o["keep_days"] if o["keep_days"] else "the old one is dropped"
+        return ("rotate %s" % name) if short else "rotate %s: %s; %s; Paperclip is updated too when it is set up" % (
+            name, new, keep)
+    if op == "config":
+        if o["state"] == "on":
+            return ("mark %s as configuration" % name) if short else (
+                "mark %s as non-secret configuration: it is no longer redacted or blocked, so anything that "
+                "prints it reaches the agent" % name)
+        return ("mark %s as a secret" % name) if short else "mark %s as a secret again (redacted and blocked)" % name
+    which = o["only"] if o["only"] else "every name in the keychain"
+    if short:
+        return "sync %s to Paperclip" % ("only " + o["only"] if o["only"] else "all names")
+    url = os.environ.get(paperclip.URL_ENV) or "(not set: it will stop with an error)"
+    return "send %s to Paperclip at %s%s" % (which, _describe_url(url), "; new versions for names it has" if o["update"]
+                                             else "; names it has are kept")
+
+
+def _describe_url(url):
+    return "".join(ch if ch.isprintable() else "?" for ch in url)[:200]
+
+
+def _age(seconds):
+    return "%d min" % (seconds // 60) if seconds < 3600 else "%d h" % (seconds // 3600)
+
+
+def cmd_pending(args, store):
+    entries = approvals.load(store.service)
+    if not entries:
+        print("no requests")
+        return
+    now, stored = time.time(), store.load()
+    for e in sorted(entries, key=lambda e: e["ts"]):
+        what = _describe(e, short=True) if _stored(e, stored) else "(names something that is not stored)"
+        print("%s  %-8s %s  (%s ago)" % (e["id"], e["status"], what, _age(int(now - e["ts"]))))
+
+
+def _ask(prompt):
+    try:
+        return input(prompt).strip().lower()[:1]
+    except EOFError:
+        return "s"
+
+
+def cmd_approve(args, store):
+    """Show each waiting request and run it on a yes. Only for a person at a terminal."""
+    require_terminal("approve", APPROVE_WHY)
+    waiting = [e for e in approvals.load(store.service) if e["status"] == "pending"]
+    if args.ids:
+        missing = [i for i in args.ids if i not in {e["id"] for e in waiting}]
+        if missing:
+            raise VaultError("no waiting request has that id (skey pending lists them)")
+        waiting = [e for e in waiting if e["id"] in args.ids]
+    if not waiting:
+        print("no requests waiting")
+        return
+    failed, stored = False, store.load()
+    for entry in waiting:
+        if not _stored(entry, stored):
+            print("%s names something that is not in the keychain; dropped" % entry["id"], file=sys.stderr)
+            approvals.resolve(store.service, entry["id"], "failed")
+            failed = True
+            continue
+        print("\n%s  asked %s ago\n  %s" % (entry["id"], _age(int(time.time() - entry["ts"])), _describe(entry)))
+        if entry["reason"]:
+            print("  the agent's reason (its own words, not checked): %s" % entry["reason"])
+        answer = _ask("approve? [y]es / [n]o, discard / [s]kip: ")
+        if answer == "n":
+            approvals.resolve(store.service, entry["id"], "denied")
+            audit.record(store.service, "deny", [] if entry["op"] == "sync" else [entry["name"]], ())
+            print("discarded")
+        elif answer == "y":
+            try:
+                result = COMMANDS[entry["op"]](parser().parse_args(_argv(entry)), store)
+            except VaultError as exc:
+                print("skey: %s" % exc, file=sys.stderr)
+                approvals.resolve(store.service, entry["id"], "failed")
+                failed = True
+                continue
+            approvals.resolve(store.service, entry["id"], "approved")
+            audit.record(store.service, "approve", [] if entry["op"] == "sync" else [entry["name"]], ())
+            failed = failed or bool(result)
+        else:
+            print("left waiting")
+    return 1 if failed else None
+
+
+def _argv(entry):
+    """The command line the entry stands for, built from its validated fields."""
+    op, name, o = entry["op"], entry["name"], entry["options"]
+    if op == "rotate":
+        return ["rotate", name, "--keep-days", str(o["keep_days"])] + (["--generate"] if o["generate"] else [])
+    if op == "config":
+        return ["config", name, o["state"]]
+    return ["sync", "paperclip"] + (["--only", o["only"]] if o["only"] else []) + (["--update"] if o["update"] else [])
+
+
 def parser():
     lines = (__doc__ or "").splitlines()
     p = argparse.ArgumentParser(prog="skey", description=lines[0] if lines else None, allow_abbrev=False,
@@ -492,6 +700,33 @@ def parser():
     add.add_argument("name", help="lowercase letters, digits and _")
     add.add_argument("--config", action="store_true",
                      help="store it as non-secret configuration (not redacted or blocked); your terminal only")
+    gen = sub.add_parser("gen", help="store a new random secret; the value is never shown", allow_abbrev=False)
+    gen.add_argument("name", help="lowercase letters, digits and _")
+    gen.add_argument("--bytes", type=int, default=GEN_DEFAULT_BYTES, metavar="N",
+                     help="bytes of randomness (default %d)" % GEN_DEFAULT_BYTES)
+    gen.add_argument("--hex", action="store_true", help="hex digits instead of URL-safe base64")
+    req = sub.add_parser("request", help="ask the user to run rotate, sync or config; they approve it later "
+                         "with skey approve", allow_abbrev=False)
+    ops = req.add_subparsers(dest="op", required=True, metavar="<op>")
+    for op, text in (("rotate", "a new value for a stored secret"), ("sync", "create the names in Paperclip"),
+                     ("config", "mark a stored entry as non-secret configuration, or back")):
+        one = ops.add_parser(op, help=text, allow_abbrev=False)
+        if op == "sync":
+            one.add_argument("target", choices=["paperclip"])
+            one.add_argument("--only", metavar="a,b")
+            one.add_argument("--update", action="store_true")
+        else:
+            one.add_argument("name")
+        if op == "rotate":
+            one.add_argument("--keep-days", type=int, default=DEFAULT_KEEP_DAYS, metavar="N")
+            one.add_argument("--generate", action="store_true", help="make the new value without showing it")
+        if op == "config":
+            one.add_argument("state", choices=["on", "off"])
+        one.add_argument("--reason", metavar="TEXT", help="why, in a few words; shown to the user")
+    sub.add_parser("pending", help="list the requests waiting for approval, and what became of the answered ones",
+                   allow_abbrev=False)
+    sub.add_parser("approve", help="answer the waiting requests (your terminal only)",
+                   allow_abbrev=False).add_argument("ids", nargs="*", metavar="id")
     cfg = sub.add_parser("config", help="mark a stored entry as non-secret configuration, or back (your terminal "
                          "only)", allow_abbrev=False)
     cfg.add_argument("name")
@@ -508,8 +743,14 @@ def parser():
     imp.add_argument("file")
     imp.add_argument("--all", action="store_true", help="import every value, not only secret-looking ones")
     imp.add_argument("--dry-run", action="store_true")
-    sub.add_parser("hook", help="Claude Code hook entry point (reads the event on stdin)",
-                   allow_abbrev=False).add_argument("kind", choices=sorted(hooks.HANDLERS))
+    hook = sub.add_parser("hook", help="hook entry point (reads the event on stdin)", allow_abbrev=False)
+    hook.add_argument("kind", choices=sorted(hooks.HANDLERS))
+    hook.add_argument("--host", choices=hosts.HOSTS,
+                      help="the event comes from this harness instead of Claude Code (vibe, pi, opencode)")
+    setup = sub.add_parser("setup", help="install the hooks into Vibe, Pi or OpenCode (your terminal only)",
+                           allow_abbrev=False)
+    setup.add_argument("harness", choices=harnesses.HARNESSES)
+    setup.add_argument("--remove", action="store_true", help="take the hooks out again")
     sub.add_parser("warm", help="unlock the keychain once, at session start", allow_abbrev=False)
     mig = sub.add_parser("migrate", help="copy secrets from the pre-3.0.0 keychain item", allow_abbrev=False)
     mig.add_argument("--dry-run", action="store_true", help="show what would be copied; change nothing")
@@ -524,6 +765,8 @@ def parser():
     rot = sub.add_parser("rotate", help="store a new value; keep the old one redacted for a while "
                                         "(your terminal only)", allow_abbrev=False)
     rot.add_argument("name")
+    rot.add_argument("--generate", action="store_true",
+                     help="make the new value here instead of asking for it; nobody sees it")
     rot.add_argument("--keep-days", type=int, default=DEFAULT_KEEP_DAYS, metavar="N",
                      help="days the old value stays redacted (default %d, 0 for none)" % DEFAULT_KEEP_DAYS)
     sub.add_parser("doctor", help="check the setup (uv, keychain, Claude Code version, install)",
@@ -533,15 +776,16 @@ def parser():
     return p
 
 
-COMMANDS = {"add": cmd_add, "config": cmd_config, "list": cmd_list, "rm": cmd_rm, "run": cmd_run, "import": cmd_import,
-            "hook": cmd_hook, "warm": cmd_warm, "migrate": cmd_migrate, "sync": cmd_sync,
+COMMANDS = {"add": cmd_add, "gen": cmd_gen, "request": cmd_request, "pending": cmd_pending,
+            "approve": cmd_approve, "config": cmd_config, "list": cmd_list, "rm": cmd_rm, "run": cmd_run, "import": cmd_import,
+            "hook": cmd_hook, "setup": cmd_setup, "warm": cmd_warm, "migrate": cmd_migrate, "sync": cmd_sync,
             "rotate": cmd_rotate, "doctor": cmd_doctor,
             "patterns": lambda a, s: print("\n".join(sorted(PATTERNS)))}
 
 
 # Commands that point at `skey migrate` when the new store is empty and the old one is not. Not the
 # hooks (they run on every tool call and talk to Claude Code) and not `patterns` (no store involved).
-HINTED = {"add", "list", "rm", "run", "import", "warm"}
+HINTED = {"add", "gen", "list", "rm", "run", "import", "warm"}
 
 
 def _reads_legacy_item():

@@ -5,6 +5,8 @@ Two numbers per hook, over N runs (default 100):
   in-process   hooks.handle() alone, on a store holding a few secrets: what the check itself costs
   end-to-end   `uv run --script plugin/bin/skey hook <kind>` as Claude Code starts it: adds uv's startup,
                the interpreter and the imports, which is what every tool call really pays
+  vibe         the same with `--host vibe` and Vibe's own payload: the extra mapping step, which Vibe, Pi
+               and OpenCode pay on every tool call and prompt
 
 The end-to-end run uses a keychain service that does not exist (SECURIKEY_SERVICE=securikey-bench-<pid>), so
 it never reads your real secrets and never prompts. It therefore measures the hook with an empty store;
@@ -43,6 +45,15 @@ def event(kind, cwd):
             "tool_input": {"command": "pytest -q tests/"}, "tool_response": {"stdout": OUTPUT, "stderr": ""}}
 
 
+def vibe_event(kind, cwd):
+    """The payload Vibe sends its pre_tool, post_tool and pre_agent hooks."""
+    if kind == "pre":
+        return {"tool_name": "bash", "cwd": cwd, "tool_input": {"command": "pytest -q tests/ && echo done"}}
+    if kind == "post":
+        return {"tool_name": "bash", "cwd": cwd, "tool_status": "success", "tool_output_text": OUTPUT}
+    return {"cwd": cwd, "prompt": "please run the tests and tell me what failed"}
+
+
 def percentile(samples, q):
     ordered = sorted(samples)
     return ordered[min(len(ordered) - 1, round(q * (len(ordered) - 1)))]
@@ -61,10 +72,12 @@ def in_process(kind, runs, cwd):
     return summarise(samples)
 
 
-def end_to_end(kind, runs, cwd):
+def end_to_end(kind, runs, cwd, host=None):
     env = {**os.environ, "SECURIKEY_SERVICE": "securikey-bench-%d" % os.getpid(), "TOKEN_VAULT_SERVICE": ""}
     command = ["uv", "run", "--quiet", "--script", str(ROOT / "plugin" / "bin" / "skey"), "hook", kind]
-    payload = json.dumps(event(kind, cwd))
+    if host:
+        command += ["--host", host]
+    payload = json.dumps(vibe_event(kind, cwd) if host == "vibe" else event(kind, cwd))
     samples = []
     for i in range(runs + 1):
         started = time.perf_counter()
@@ -86,13 +99,15 @@ def main():
     over = False
     with tempfile.TemporaryDirectory() as cwd:
         print("%-12s %-5s %9s %9s %9s" % ("mode", "hook", "p50 ms", "p95 ms", "max ms"))
-        for mode, fn in (("in-process", in_process), ("end-to-end", end_to_end)):
-            if mode == "end-to-end" and args.skip_end_to_end:
+        modes = (("in-process", in_process, ("pre", "post")), ("end-to-end", end_to_end, ("pre", "post")),
+                 ("vibe", lambda kind, runs, cwd: end_to_end(kind, runs, cwd, "vibe"), ("pre", "post", "prompt")))
+        for mode, fn, kinds in modes:
+            if mode != "in-process" and args.skip_end_to_end:
                 continue
-            for kind in ("pre", "post"):
+            for kind in kinds:
                 s = fn(kind, args.runs, cwd)
                 flag = ""
-                if mode == "end-to-end" and s["p95"] > args.budget_ms:
+                if mode != "in-process" and s["p95"] > args.budget_ms:
                     over, flag = True, "  OVER BUDGET (%.0f ms)" % args.budget_ms
                 print("%-12s %-5s %9.1f %9.1f %9.1f%s" % (mode, kind, s["p50"], s["p95"], s["max"], flag))
     return 1 if over else 0
