@@ -58,6 +58,8 @@ Full list, with the reasons: [docs/limits.md](docs/limits.md).
 - A secret in an unknown format that you never stored can't be recognised; store it and it is covered exactly. Values under 8 characters are never redacted.
 - If the keychain is locked, the hooks fall back to pattern matching and tell you.
 - Vibe, Pi and OpenCode are covered through `skey setup`, with limits of their own: the harness's own session log can keep the raw value, and an agent allowed to write in the harness's config folder could edit the hooks. [Details](docs/limits.md#other-harnesses-vibe-pi-opencode).
+- The hook that keeps an agent from reading a dotenv file reads a command as shell, not as raw text. A name in **one simple command** (`echo`, `git commit -m`, a `grep` pattern, a heredoc to `cat`) is a mention and is allowed. A call of several commands that names a file is denied even if every command is harmless: split the call, or write the note with the editor tool. The separate check on the commands only you may run (`skey sync`, `skey rotate`, `skey config`, `skey add --config`) has no such exemption: text that names them is denied. [Details](docs/limits.md#dotenv-files).
+- The hook's check of `skey run --dotenv FILE` is a best-effort layer. It follows wrappers (`env`, `sudo`), nested runs, shell heredocs and substitutions, but not every spelling: a program or flag built by an expansion, text piped into a shell, and a script written in one call and run in another get past it. What does not depend on spelling is `skey run`'s own output filter. [Details](docs/limits.md#dotenv-files).
 - The `skey` CLI works from any shell.
 
 ## Install
@@ -156,7 +158,7 @@ skey run --dotenv .env -- npm run dev           # the child gets API_KEY=<the re
 skey run --env API_KEY=api_key -- npm run dev   # or name the secret directly
 ```
 
-`skey run` resolves the references into the child's environment. At a terminal it then replaces itself with the command. When its stdout is piped (the way an agent runs it) it runs the command, passes the exit status through and redacts stdout and stderr itself; `SECURIKEY_RUN_FILTER=0` turns that off. An application that reads the dotenv file itself, without `skey run`, sees the literal `securikey:api_key`.
+`skey run` resolves the references into the child's environment. At a terminal it then replaces itself with the command. When its stdout is piped (the way an agent runs it) it runs the command, passes the exit status through and redacts stdout and stderr itself. That includes the secret-looking plain values it loaded from a `--dotenv` file (any path), with a notice naming the file; short or plain-looking values are not redacted. `SECURIKEY_RUN_FILTER=0` turns the filter off. An application that reads the dotenv file itself, without `skey run`, sees the literal `securikey:api_key`.
 
 `skey run --dotenv <file>` is only allowed when **every** value in the file is already a name: a file that still holds a plaintext value would put it into the child's environment, so the hook blocks it and asks for `skey import` first. `skey import` moves the values it recognises and tells you which ones it left behind, because those are still in the file in plaintext. It treats `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASS`, `PRIVATE`, `CREDENTIAL`, `AUTH` and `DSN` keys, and any provider-shaped token, as secrets; `skey import --all` moves everything.
 
@@ -173,7 +175,7 @@ Running under Paperclip or another host that injects secrets into the environmen
 - **Fail closed where it matters.** All three Claude Code hooks set `onFailure: block`, so a broken install stops tool calls and prompts instead of silently waving them through, and any other failure inside a hook denies, blocks or replaces the output rather than passing it unjudged. The Vibe, Pi and OpenCode hooks do the same.
 - **One implementation for every harness.** The other harnesses get thin shims that call `skey hook --host`; payload mapping is unit-tested in the Python suite, and the shims were checked against the real harnesses with a stub model server.
 - **The limits are tested, not just written down.** Known bypasses are pinned as tests, and hook behaviour is checked against a real Claude Code session, not only unit tests: that is how the failing-command gap was found.
-- **Small:** about 3,400 lines of stdlib Python plus `keyring` and about 170 lines of TypeScript shims, with hermetic tests.
+- **Small:** about 4,500 lines of stdlib Python plus `keyring` and about 170 lines of TypeScript shims, with hermetic tests.
 
 ## Develop
 

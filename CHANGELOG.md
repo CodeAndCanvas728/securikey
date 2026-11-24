@@ -1,5 +1,14 @@
 # Changelog
 
+## [3.7.1] - 2026-11-23
+
+Docs only: the README now describes what 3.6.0 and 3.7.0 changed. No code change.
+
+### Changed
+- README, Limits at a glance: two bullets. The dotenv name guard reads a command as shell, so a name in one simple command is allowed and a call of several commands that names a file is denied (as before 3.6.0; the message says to split the call). The hook's check of the run command's dotenv flag is a best-effort layer, with the output filter as the control; both link to `docs/limits.md`.
+- README, How the references work: the run command's output filter also redacts the secret-looking plain values it loads from a dotenv file, and prints a notice.
+- README, Design choices: the code size is about 4,500 lines of Python, not 3,400 (it was 3,818 at 3.5.0; 3.6.0 added the shell reader and 3.7.0 the layer).
+
 ## [3.7.0] - 2026-11-23
 
 The hook also reads a `skey run --dotenv FILE` that hides behind a wrapper, a nested run, a shell heredoc or a substitution. This is the best-effort layer that was split out of the 3.6.0 change, where review rounds 3 to 9 each found one more spelling. It adds to the check 3.6.0 keeps (main's text check), and never replaces it.
